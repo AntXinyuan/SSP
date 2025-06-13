@@ -5,6 +5,20 @@
 
 🔥 We appreciate the attention to our paper. The code will be organized and released as soon as possible.
 
+> Production from Institute of Computing Technology, Chinese Academy of Sciences.
+
+> Primary contact: Xinyuan Liu ( liuxinyuan21s@ict.ac.cn ).
+
+## TL;DR
+This repository contains the source code of [**Semantic-decoupled Spatial Partition Guided Point-supervised Oriented Object Detection**](https://arxiv.org/pdf/2506.10601).
+
+To tackle inadequate sample assignment and instance confusion in point-supervised oriented object detection for remote sensing dense scenes, we propose SSP (Semantic-decoupled Spatial Partition), a framework integrating rule-driven prior injection and data-driven label purification. Its core innovations include pixel-level spatial partition for sample assignment and semantic-modulated box extraction for pseudo-label generation. 
+
+![method](figs/pipeline.png "Method pipeline")
+
+## Updates 
+- [2025.6.13] TopoPoint paper is released at [arXiv](https://arxiv.org/abs/2506.10601).
+
 ## Citation
 If this work is helpful for your research, please consider citing the following BibTeX entry.
 
