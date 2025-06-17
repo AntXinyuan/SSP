@@ -560,3 +560,33 @@ class RMosaic(Mosaic):
                      (bbox_h > self.min_bbox_size)
         valid_inds = np.nonzero(valid_inds)[0]
         return bboxes[valid_inds], labels[valid_inds]
+
+
+@ROTATED_PIPELINES.register_module()
+class RBox2PointWithNoise:
+    """Convert boxes in results to a certain box type.
+
+    Args:
+        box_type_mapping (dict): A dictionary whose key will be used to search
+            the item in `results`, the value is the destination box type.
+    """
+
+    def __init__(self, p=0.1) -> None:
+        self.p = p
+        pass
+
+    def __call__(self, results: dict) -> dict:
+        """The call function."""
+        return self.transform(results)
+
+    def transform(self, results: dict) -> dict:
+        """The transform function."""
+
+        h = np.min(results['gt_bboxes'][:, 2:4], 1)
+        results['gt_bboxes'][:, 0] += (np.random.rand() * 2 - 1) * self.p * h
+        results['gt_bboxes'][:, 1] += (np.random.rand() * 2 - 1) * self.p * h
+        results['gt_bboxes'][:, 2] = 0.1
+        results['gt_bboxes'][:, 3] = 0.1
+        results['gt_bboxes'][:, 4] = 0
+
+        return results

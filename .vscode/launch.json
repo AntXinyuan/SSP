@@ -1,0 +1,46 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Single Train",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "configs/ssp/rfcos_ssp_dotav10.py",
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "0"
+            },       
+        },
+        {
+            "name": "Distributed Train",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.launch",
+            "args": [
+                "--nnodes=1",
+                "--node_rank=0",
+                "--master_addr=127.0.0.1",
+                "--nproc_per_node=2",
+                "--master_port=9337",
+                "tools/train.py", 
+                "configs/ssp/rfcos_ssp_dotav10.py",
+                "--seed", "2423",
+                "--launcher", "pytorch"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}:${PYTHONPATH}",
+                "CUDA_VISIBLE_DEVICES": "2,3"
+            },
+            "justMyCode": false,
+            "console": "integratedTerminal",
+        },
+    ]
+}

@@ -8,12 +8,26 @@ from mmcv.utils import print_log
 from mmdet.core import average_precision
 from terminaltables import AsciiTable
 
+from scipy.spatial.distance import cdist
+
+def disturb_boxes(det_bboxes, gt_bboxes, eps=None):
+    #print(f'eps={eps}')
+    det_bboxes = torch.from_numpy(det_bboxes[:, :5]).float()
+    gt_bboxes = torch.from_numpy(gt_bboxes).float()
+    if eps is None or eps == 0:
+        return det_bboxes, gt_bboxes
+    too_near_mask = torch.abs(det_bboxes - gt_bboxes) < eps
+    det_bboxes[too_near_mask & (det_bboxes > gt_bboxes)] += eps
+    det_bboxes[too_near_mask & (det_bboxes < gt_bboxes)] -= eps
+    return det_bboxes, gt_bboxes
+
 
 def tpfp_default(det_bboxes,
                  gt_bboxes,
                  gt_bboxes_ignore=None,
                  iou_thr=0.5,
-                 area_ranges=None):
+                 area_ranges=None,
+                 iou_eps=None):
     """Check if detected bboxes are true positive or false positive.
 
     Args:
@@ -55,11 +69,16 @@ def tpfp_default(det_bboxes,
             fp[...] = 1
         else:
             raise NotImplementedError
-        return tp, fp
+        return tp, fp, 0.0
 
-    ious = box_iou_rotated(
-        torch.from_numpy(det_bboxes).float(),
-        torch.from_numpy(gt_bboxes).float()).numpy()
+    ious = box_iou_rotated(*disturb_boxes(det_bboxes, gt_bboxes, eps=iou_eps)).numpy()
+    #ious = box_iou_rotated(
+    #    torch.from_numpy(det_bboxes).float(),
+    #    torch.from_numpy(gt_bboxes).float()).numpy()
+
+    pair_mathced_gt_id = cdist(det_bboxes[:, :2], gt_bboxes[:, :2]).argmin(axis=1)
+    pair_ious = ious[np.arange(num_dets), pair_mathced_gt_id]
+
     # for each det, the max iou with all gts
     ious_max = ious.max(axis=1)
     # for each det, which gt overlaps most with it
@@ -91,7 +110,7 @@ def tpfp_default(det_bboxes,
                 area = bbox[2] * bbox[3]
                 if area >= min_area and area < max_area:
                     fp[k, i] = 1
-    return tp, fp
+    return tp, fp, pair_ious.sum()
 
 
 def get_cls_results(det_results, annotations, class_id):
@@ -130,7 +149,8 @@ def eval_rbbox_map(det_results,
                    use_07_metric=True,
                    dataset=None,
                    logger=None,
-                   nproc=4):
+                   nproc=4,
+                   iou_eps=None):
     """Evaluate mAP of a rotated dataset.
 
     Args:
@@ -182,8 +202,9 @@ def eval_rbbox_map(det_results,
             tpfp_default,
             zip(cls_dets, cls_gts, cls_gts_ignore,
                 [iou_thr for _ in range(num_imgs)],
-                [area_ranges for _ in range(num_imgs)]))
-        tp, fp = tuple(zip(*tpfp))
+                [area_ranges for _ in range(num_imgs)],
+                [iou_eps for _ in range(num_imgs)]))
+        tp, fp, iou  = tuple(zip(*tpfp))
         # calculate gt number of each scale
         # ignored gts or gts beyond the specific scale are not counted
         num_gts = np.zeros(num_scales, dtype=int)
@@ -214,12 +235,16 @@ def eval_rbbox_map(det_results,
             num_gts = num_gts.item()
         mode = 'area' if not use_07_metric else '11points'
         ap = average_precision(recalls, precisions, mode)
+
+        iou = np.array(iou).sum() / (num_dets+1e-8)
+
         eval_results.append({
             'num_gts': num_gts,
             'num_dets': num_dets,
             'recall': recalls,
             'precision': precisions,
-            'ap': ap
+            'ap': ap,
+            'iou':iou
         })
     pool.close()
     if scale_ranges is not None:
@@ -280,12 +305,14 @@ def print_map_summary(mean_ap,
 
     recalls = np.zeros((num_scales, num_classes), dtype=np.float32)
     aps = np.zeros((num_scales, num_classes), dtype=np.float32)
+    ious = np.zeros((num_scales, num_classes), dtype=np.float32)
     num_gts = np.zeros((num_scales, num_classes), dtype=int)
     for i, cls_result in enumerate(results):
         if cls_result['recall'].size > 0:
             recalls[:, i] = np.array(cls_result['recall'], ndmin=2)[:, -1]
         aps[:, i] = cls_result['ap']
         num_gts[:, i] = cls_result['num_gts']
+        ious[:, i] = cls_result['iou']
 
     if dataset is None:
         label_names = [str(i) for i in range(num_classes)]
@@ -295,7 +322,7 @@ def print_map_summary(mean_ap,
     if not isinstance(mean_ap, list):
         mean_ap = [mean_ap]
 
-    header = ['class', 'gts', 'dets', 'recall', 'ap']
+    header = ['class', 'gts', 'dets', 'recall', 'ap', 'iou']
     for i in range(num_scales):
         if scale_ranges is not None:
             print_log(f'Scale range {scale_ranges[i]}', logger=logger)
@@ -303,10 +330,19 @@ def print_map_summary(mean_ap,
         for j in range(num_classes):
             row_data = [
                 label_names[j], num_gts[i, j], results[j]['num_dets'],
-                f'{recalls[i, j]:.3f}', f'{aps[i, j]:.3f}'
+                f'{recalls[i, j]:.3f}', f'{aps[i, j]:.3f}',
+                f'{ious[i, j]:.3f}'
             ]
             table_data.append(row_data)
-        table_data.append(['mAP', '', '', '', f'{mean_ap[i]:.3f}'])
+
+        table_data.append(['', '', '', '', '', ''])
+        ins_map = aps[0] * num_gts[0] / num_gts[0].sum()
+        ins_miou = ious[0] * num_gts[0] / num_gts[0].sum()
+        table_data.append(['ins-mean', '', '', '', f'{ins_map.mean():.4f}', f'{ins_miou.mean():.4f}'])
+
+        mean_iou = ious[0].mean()
+        table_data.append(['cls-mean', '', '', '', f'{mean_ap[i]:.4f}', f'{mean_iou:.4f}'])
+
         table = AsciiTable(table_data)
         table.inner_footing_row_border = True
         print_log('\n' + table.table, logger=logger)

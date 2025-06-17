@@ -88,7 +88,10 @@ def imshow_det_rbboxes(img,
                        win_name='',
                        show=True,
                        wait_time=0,
-                       out_file=None):
+                       out_file=None,
+                       show_text=True,
+                       pointsets=None,
+                       ps_labels=None):
     """Draw bboxes and class labels (with scores) on an image.
 
     Args:
@@ -122,7 +125,7 @@ def imshow_det_rbboxes(img,
     """
     assert bboxes is None or bboxes.ndim == 2, \
         f' bboxes ndim should be 2, but its ndim is {bboxes.ndim}.'
-    assert labels.ndim == 1, \
+    assert labels is None or labels.ndim == 1, \
         f' labels ndim should be 1, but its ndim is {labels.ndim}.'
     assert bboxes is None or bboxes.shape[1] == 5 or bboxes.shape[1] == 6, \
         f' bboxes.shape[1] should be 5 or 6, but its {bboxes.shape[1]}.'
@@ -130,8 +133,8 @@ def imshow_det_rbboxes(img,
         'labels.shape[0] should not be less than bboxes.shape[0].'
     assert segms is None or segms.shape[0] == labels.shape[0], \
         'segms.shape[0] and labels.shape[0] should have the same length.'
-    assert segms is not None or bboxes is not None, \
-        'segms and bboxes should not be None at the same time.'
+    # assert segms is not None or bboxes is not None, \
+    #     'segms and bboxes should not be None at the same time.'
 
     img = mmcv.imread(img).astype(np.uint8)
 
@@ -177,16 +180,17 @@ def imshow_det_rbboxes(img,
         areas = bboxes[:, 2] * bboxes[:, 3]
         scales = _get_adaptive_scales(areas)
         scores = bboxes[:, 5] if bboxes.shape[1] == 6 else None
-        draw_labels(
-            ax,
-            labels[:num_bboxes],
-            positions,
-            scores=scores,
-            class_names=class_names,
-            color=text_colors,
-            font_size=font_size,
-            scales=scales,
-            horizontal_alignment=horizontal_alignment)
+        if show_text:
+            draw_labels(
+                ax,
+                labels[:num_bboxes],
+                positions,
+                scores=scores,
+                class_names=class_names,
+                color=text_colors,
+                font_size=font_size,
+                scales=scales,
+                horizontal_alignment=horizontal_alignment)
 
     if segms is not None:
         mask_palette = get_palette(mask_color, max_label + 1)
@@ -217,6 +221,11 @@ def imshow_det_rbboxes(img,
                 scales=scales,
                 horizontal_alignment=horizontal_alignment)
 
+    if pointsets is not None:
+        colors = get_rainbow_color(len(pointsets), dtype=float)
+        for ps, c in zip(pointsets, colors):
+            ax.scatter(ps[:, 0], ps[:, 1], c=[c,]*len(ps), s=thickness)      
+    
     plt.imshow(img)
 
     stream, _ = canvas.print_to_buffer()
@@ -242,3 +251,13 @@ def imshow_det_rbboxes(img,
     plt.close()
 
     return img
+
+
+import colorsys
+def get_rainbow_color(color_num, dtype=float):
+    rainbow_colors = []
+    for i in range(color_num):
+        hue = i / color_num  # 在色相空间均匀分布
+        rgb = tuple([(val if dtype == float else int(val * 255)) for val in colorsys.hsv_to_rgb(hue, 1, 1)])
+        rainbow_colors.append(rgb)
+    return rainbow_colors

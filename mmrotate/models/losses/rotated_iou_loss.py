@@ -44,6 +44,8 @@ def rotated_iou_loss(pred, target, linear=False, mode='log', eps=1e-6):
     if diff_iou_rotated_2d is None:
         raise ImportError('Please install mmcv-full >= 1.5.0.')
 
+    pred[:, 2:4].clamp_(min=eps)
+    target[:, 2:4].clamp_(min=eps)
     ious = diff_iou_rotated_2d(pred.unsqueeze(0), target.unsqueeze(0))
     ious = ious.squeeze(0).clamp(min=eps)
 

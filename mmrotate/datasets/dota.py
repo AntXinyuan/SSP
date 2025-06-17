@@ -5,6 +5,7 @@ import os.path as osp
 import re
 import tempfile
 import time
+import warnings
 import zipfile
 from collections import defaultdict
 from functools import partial
@@ -44,9 +45,11 @@ class DOTADataset(CustomDataset):
                  pipeline,
                  version='oc',
                  difficulty=100,
+                 img_format='png',
                  **kwargs):
         self.version = version
         self.difficulty = difficulty
+        self.img_format = img_format
 
         super(DOTADataset, self).__init__(ann_file, pipeline, **kwargs)
 
@@ -65,26 +68,29 @@ class DOTADataset(CustomDataset):
         ann_files = glob.glob(ann_folder + '/*.txt')
         data_infos = []
         if not ann_files:  # test phase
-            ann_files = glob.glob(ann_folder + '/*.png')
+            ann_files = glob.glob(ann_folder + f'/*.{self.img_format}')
             for ann_file in ann_files:
                 data_info = {}
                 img_id = osp.split(ann_file)[1][:-4]
-                img_name = img_id + '.png'
+                img_name = img_id + f'.{self.img_format}'
                 data_info['filename'] = img_name
                 data_info['ann'] = {}
-                data_info['ann']['bboxes'] = []
-                data_info['ann']['labels'] = []
+                data_info['ann']['bboxes'] = np.zeros(
+                        (0, 5), dtype=np.float32)
+                data_info['ann']['labels'] = np.array(
+                        [], dtype=np.int64)
                 data_infos.append(data_info)
         else:
             for ann_file in ann_files:
                 data_info = {}
                 img_id = osp.split(ann_file)[1][:-4]
-                img_name = img_id + '.png'
+                img_name = img_id + f'.{self.img_format}'
                 data_info['filename'] = img_name
                 data_info['ann'] = {}
                 gt_bboxes = []
                 gt_labels = []
                 gt_polygons = []
+                gt_difficulties = []
                 gt_bboxes_ignore = []
                 gt_labels_ignore = []
                 gt_polygons_ignore = []
@@ -96,13 +102,23 @@ class DOTADataset(CustomDataset):
                     s = f.readlines()
                     for si in s:
                         bbox_info = si.split()
-                        poly = np.array(bbox_info[:8], dtype=np.float32)
-                        try:
-                            x, y, w, h, a = poly2obb_np(poly, self.version)
-                        except:  # noqa: E722
-                            continue
-                        cls_name = bbox_info[8]
-                        difficulty = int(bbox_info[9])
+                        if len(bbox_info) == 7:
+                            x, y, w, h, a = list(map(float, bbox_info[:5]))
+                            w, h = max(w, 1), max(h, 1)  # avoid zero size
+                            try:
+                                poly = np.array(obb2poly_np(np.array([[x,y,w,h,a, 0]]), self.version)[0][:8], dtype=np.float32)
+                            except:  # noqa: E722
+                                continue
+                            cls_name = bbox_info[5]
+                            difficulty = int(bbox_info[6])
+                        else:
+                            poly = np.array(bbox_info[:8], dtype=np.float32)
+                            try:
+                                x, y, w, h, a = poly2obb_np(poly, self.version)
+                            except:  # noqa: E722
+                                continue
+                            cls_name = bbox_info[8]
+                            difficulty = int(bbox_info[9])
                         label = cls_map[cls_name]
                         if difficulty > self.difficulty:
                             pass
@@ -110,6 +126,7 @@ class DOTADataset(CustomDataset):
                             gt_bboxes.append([x, y, w, h, a])
                             gt_labels.append(label)
                             gt_polygons.append(poly)
+                            gt_difficulties.append(difficulty)
 
                 if gt_bboxes:
                     data_info['ann']['bboxes'] = np.array(
@@ -118,12 +135,15 @@ class DOTADataset(CustomDataset):
                         gt_labels, dtype=np.int64)
                     data_info['ann']['polygons'] = np.array(
                         gt_polygons, dtype=np.float32)
+                    data_info['ann']['difficulties'] = np.array(
+                        gt_difficulties, dtype=np.int64)
                 else:
                     data_info['ann']['bboxes'] = np.zeros((0, 5),
                                                           dtype=np.float32)
                     data_info['ann']['labels'] = np.array([], dtype=np.int64)
                     data_info['ann']['polygons'] = np.zeros((0, 8),
                                                             dtype=np.float32)
+                    data_info['ann']['difficulties'] = np.array([], dtype=np.int64)
 
                 if gt_polygons_ignore:
                     data_info['ann']['bboxes_ignore'] = np.array(
@@ -168,7 +188,8 @@ class DOTADataset(CustomDataset):
                  proposal_nums=(100, 300, 1000),
                  iou_thr=0.5,
                  scale_ranges=None,
-                 nproc=4):
+                 nproc=4,
+                 iou_eps=None):
         """Evaluate the dataset.
 
         Args:
@@ -205,7 +226,8 @@ class DOTADataset(CustomDataset):
                 iou_thr=iou_thr,
                 dataset=self.CLASSES,
                 logger=logger,
-                nproc=nproc)
+                nproc=nproc,
+                iou_eps=iou_eps)
             eval_results['mAP'] = mean_ap
         else:
             raise NotImplementedError
@@ -218,17 +240,37 @@ class DOTADataset(CustomDataset):
         Args:
             results (list): Testing results of the dataset.
             nproc (int): number of process. Default: 4.
+
+        Returns:
+            list: merged results.
         """
+
+        def extract_xy(img_id):
+            """Extract x and y coordinates from image ID.
+
+            Args:
+                img_id (str): ID of the image.
+
+            Returns:
+                Tuple of two integers, the x and y coordinates.
+            """
+            pattern = re.compile(r'__(\d+)___(\d+)')
+            match = pattern.search(img_id)
+            if match:
+                x, y = int(match.group(1)), int(match.group(2))
+                return x, y
+            else:
+                warnings.warn(
+                    "Can't find coordinates in filename, "
+                    'the coordinates will be set to (0,0) by default.',
+                    category=Warning)
+                return 0, 0
+
         collector = defaultdict(list)
-        for idx in range(len(self)):
+        for idx, img_id in enumerate(self.img_ids):
             result = results[idx]
-            img_id = self.img_ids[idx]
-            splitname = img_id.split('__')
-            oriname = splitname[0]
-            pattern1 = re.compile(r'__\d+___\d+')
-            x_y = re.findall(pattern1, img_id)
-            x_y_2 = re.findall(r'\d+', x_y[0])
-            x, y = int(x_y_2[0]), int(x_y_2[1])
+            oriname = img_id.split('__', maxsplit=1)[0]
+            x, y = extract_xy(img_id)
             new_result = []
             for i, dets in enumerate(result):
                 bboxes, scores = dets[:, :-1], dets[:, [-1]]
@@ -244,11 +286,11 @@ class DOTADataset(CustomDataset):
 
         merge_func = partial(_merge_func, CLASSES=self.CLASSES, iou_thr=0.1)
         if nproc <= 1:
-            print('Single processing')
+            print('Executing on Single Processor')
             merged_results = mmcv.track_iter_progress(
                 (map(merge_func, collector.items()), len(collector)))
         else:
-            print('Multiple processing')
+            print(f'Executing on {nproc} processors')
             merged_results = mmcv.track_parallel_progress(
                 merge_func, list(collector.items()), nproc)
 
@@ -359,3 +401,50 @@ def _merge_func(info, CLASSES, iou_thr):
                                               iou_thr)
             big_img_results.append(nms_dets.cpu().numpy())
     return img_id, big_img_results
+
+
+@ROTATED_DATASETS.register_module()
+class DOTAv15Dataset(DOTADataset):
+    """DOTA dataset for detection.
+
+    Args:
+        ann_file (str): Annotation file path.
+        pipeline (list[dict]): Processing pipeline.
+        version (str, optional): Angle representations. Defaults to 'oc'.
+        difficulty (bool, optional): The difficulty threshold of GT.
+    """
+    CLASSES = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
+               'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
+               'basketball-court', 'storage-tank', 'soccer-ball-field', 'roundabout',
+               'harbor', 'swimming-pool', 'helicopter', 'container-crane')
+
+    PALETTE = [(165, 42, 42), (189, 183, 107), (0, 255, 0), (255, 0, 0),
+                    (138, 43, 226), (255, 128, 0), (255, 0, 255),
+                    (0, 255, 255), (255, 193, 193), (0, 51, 153),
+                    (255, 250, 205), (0, 139, 139), (255, 255, 0),
+                    (147, 116, 116), (0, 0, 255), (220, 20, 60)]
+    
+
+
+@ROTATED_DATASETS.register_module()
+class DOTAv2Dataset(DOTADataset):
+    """DOTA dataset for detection.
+
+    Args:
+        ann_file (str): Annotation file path.
+        pipeline (list[dict]): Processing pipeline.
+        version (str, optional): Angle representations. Defaults to 'oc'.
+        difficulty (bool, optional): The difficulty threshold of GT.
+    """
+    CLASSES = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
+               'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
+               'basketball-court', 'storage-tank', 'soccer-ball-field', 'roundabout',
+               'harbor', 'swimming-pool', 'helicopter', 'container-crane', 'airport',
+               'helipad')
+
+    PALETTE = [(165, 42, 42), (189, 183, 107), (0, 255, 0), (255, 0, 0),
+               (138, 43, 226), (255, 128, 0), (255, 0, 255),
+               (0, 255, 255), (255, 193, 193), (0, 51, 153),
+               (255, 250, 205), (0, 139, 139), (255, 255, 0),
+               (147, 116, 116), (0, 0, 255), (220, 20, 60), (119, 11, 32),
+               (0, 0, 142)]
