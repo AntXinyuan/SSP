@@ -41,9 +41,9 @@ if __name__ == '__main__':
 
     pse_dir = 'pseudo_labels/ssp_dotav10_hybrid/'
     #pse_dir = 'pseudo_labels/ssp_dotav15_hybrid/'
-    #pse_dir = 'pseudo_labels/ssp_dotav15_hybrid/'
+    #pse_dir = 'pseudo_labels/ssp_dotav20_hybrid/'
     pse_cfg = cfg.data.train.copy()
-    #pse_cfg['ann_file'] = pse_dir
+    pse_cfg['ann_file'] = pse_dir
     pse_dataset = build_dataset(pse_cfg)
     print(pse_dataset)
 

@@ -122,3 +122,10 @@ tmp
 
 # custom
 mmrotate/.mim
+
+testmodel/
+pseudo_labels/
+work_dirs/
+datasets/
+pretrained/
+release/
