@@ -12,11 +12,31 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "configs/ssp/rfcos_ssp_dotav10.py",
+                //"configs/ssp/rfcos_ssp_dotav10.py",
+                //"configs/ssp/ssp_label_marker.py",
+                "--checkpoint", "work_dirs/ssp_label_marker/epoch_5.pth",
+                //"--resume", "work_dirs/ssp_label_marker/epoch_5.pth",
+                "--seed", "2423",
+                "--no-validate",
+                //"--rand_k", "20",
+                "--image_list", 
+                "P1464__1024__0___0.png",
+                "P0734__1024__0___0.png",
+                "P0858__1024__824___441.png",
+                "P1387__1024__0___2472.png", 
+                "--cfg-options",
+                "optimizer.lr=0.0",
+                "runner.max_epochs=1",
+                "log_config.interval=1",
+                "checkpoint_config.interval=-1",
+                "checkpoint_config.save_last=False",
+                "model.bbox_head.is_record_stage=True",
+                "model.train_cfg.visualize_dir=vis/4imgs", 
+                //"model.train_cfg.pseudo_label_dir=pseudo_labels/test-labels"
             ],
             "env": {
                 "PYTHONPATH": "${workspaceFolder}",
-                "CUDA_VISIBLE_DEVICES": "0"
+                "CUDA_VISIBLE_DEVICES": "3"
             },       
         },
         {
@@ -36,8 +56,24 @@
                 "--launcher", "pytorch"
             ],
             "env": {
-                "PYTHONPATH": "${workspaceFolder}:${PYTHONPATH}",
+                "PYTHONPATH": "${workspaceFolder}",
                 "CUDA_VISIBLE_DEVICES": "2,3"
+            },
+            "justMyCode": false,
+            "console": "integratedTerminal",
+        },
+        {
+            "name": "Publish Model",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/model_converters/publish_model.py",
+            "args": [
+                "pretrained/ssp_epoch_5.pth",
+                "pretrained/ssp_labelmarker_dotav10.pth"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "3"
             },
             "justMyCode": false,
             "console": "integratedTerminal",

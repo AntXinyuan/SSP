@@ -125,7 +125,7 @@ mmrotate/.mim
 
 testmodel/
 pseudo_labels/
-work_dirs/
+work_dirs/**
 datasets/
 pretrained/
 release/

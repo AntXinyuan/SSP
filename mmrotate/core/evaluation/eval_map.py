@@ -11,9 +11,12 @@ from terminaltables import AsciiTable
 from scipy.spatial.distance import cdist
 
 def disturb_boxes(det_bboxes, gt_bboxes, eps=None):
-    #print(f'eps={eps}')
-    det_bboxes = torch.from_numpy(det_bboxes[:, :5]).float()
-    gt_bboxes = torch.from_numpy(gt_bboxes).float()
+    if isinstance(det_bboxes, np.ndarray):
+        det_bboxes = torch.from_numpy(det_bboxes[:, :5]).float()
+        gt_bboxes = torch.from_numpy(gt_bboxes[:, :5]).float()
+    else:
+        det_bboxes = det_bboxes[:, :5].clone().detach().float()
+        gt_bboxes = gt_bboxes[:, :5].clone().detach().float()
     if eps is None or eps == 0:
         return det_bboxes, gt_bboxes
     too_near_mask = torch.abs(det_bboxes - gt_bboxes) < eps
@@ -190,21 +193,28 @@ def eval_rbbox_map(det_results,
     area_ranges = ([(rg[0]**2, rg[1]**2) for rg in scale_ranges]
                    if scale_ranges is not None else None)
 
-    pool = get_context('spawn').Pool(nproc)
+    if nproc > 0:
+        pool = get_context('spawn').Pool(nproc)
     eval_results = []
     for i in range(num_classes):
         # get gt and det bboxes of this class
         cls_dets, cls_gts, cls_gts_ignore = get_cls_results(
             det_results, annotations, i)
 
-        # compute tp and fp for each image with multiple processes
-        tpfp = pool.starmap(
-            tpfp_default,
-            zip(cls_dets, cls_gts, cls_gts_ignore,
-                [iou_thr for _ in range(num_imgs)],
-                [area_ranges for _ in range(num_imgs)],
-                [iou_eps for _ in range(num_imgs)]))
-        tp, fp, iou  = tuple(zip(*tpfp))
+        if nproc > 0:
+            # compute tp and fp for each image with multiple processes
+            tpfp = pool.starmap(
+                tpfp_default,
+                zip(cls_dets, cls_gts, cls_gts_ignore,
+                    [iou_thr for _ in range(num_imgs)],
+                    [area_ranges for _ in range(num_imgs)],
+                    [iou_eps for _ in range(num_imgs)]))
+            tp, fp, iou  = tuple(zip(*tpfp))
+        else:
+            tp, fp, iou = zip(*[
+                tpfp_default(det, gt, ignore, iou_thr, area_ranges, iou_eps)
+                for det, gt, ignore in zip(cls_dets, cls_gts, cls_gts_ignore)])
+
         # calculate gt number of each scale
         # ignored gts or gts beyond the specific scale are not counted
         num_gts = np.zeros(num_scales, dtype=int)
@@ -246,7 +256,8 @@ def eval_rbbox_map(det_results,
             'ap': ap,
             'iou':iou
         })
-    pool.close()
+    if nproc > 0:
+        pool.close()
     if scale_ranges is not None:
         # shape (num_classes, num_scales)
         all_ap = np.vstack([cls_result['ap'] for cls_result in eval_results])
@@ -346,3 +357,34 @@ def print_map_summary(mean_ap,
         table = AsciiTable(table_data)
         table.inner_footing_row_border = True
         print_log('\n' + table.table, logger=logger)
+
+def eval_rbox_single_image(pseudo_bboxes, gt_bboxes, gt_labels=None, num_cls=None, class_aware=True, metrics=['mIoU', 'mAP']): 
+    iou_eps = 1e-3
+    results = {}
+    if 'mIoU' in metrics:
+        ious = box_iou_rotated(*disturb_boxes(pseudo_bboxes, gt_bboxes, iou_eps), aligned=True)
+        if class_aware:
+            assert gt_labels is not None and num_cls is not None
+            mIoU = sum([ious[gt_labels == cls_id, cls_id].mean() for cls_id in range(num_cls)]) / num_cls
+        else:
+            mIoU = ious.mean()
+        results['mIoU'] = mIoU
+    if 'mAP' in metrics:
+        num_instances = gt_labels.size(0)
+        gt_bboxes = gt_bboxes.detach().cpu().numpy()
+        gt_labels = gt_labels.detach().cpu().numpy()
+        pseudo_bboxes = np.concatenate([pseudo_bboxes.detach().cpu().numpy(), np.ones((num_instances,1))], -1)
+        if class_aware:
+            pseudo_bboxes_per_cls = []
+            for cls_id in range(num_cls):
+                pseudo_bboxes_per_cls.append(pseudo_bboxes[gt_labels == cls_id])
+        else:
+            gt_labels = np.zeros_like(gt_labels)
+            pseudo_bboxes_per_cls = [pseudo_bboxes,]
+            
+        mAP, _ = eval_rbbox_map([pseudo_bboxes_per_cls,], 
+                                [dict(bboxes=gt_bboxes, labels=gt_labels),], 
+                                iou_thr=0.5, nproc=0, iou_eps=iou_eps, logger='silent')
+        results['mAP'] = mAP
+            
+    return results, ious.detach().cpu().numpy() 

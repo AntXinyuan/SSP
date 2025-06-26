@@ -10,7 +10,7 @@ import mmcv
 import torch
 import torch.distributed as dist
 from mmcv import Config, DictAction
-from mmcv.runner import get_dist_info, init_dist
+from mmcv.runner import get_dist_info, init_dist, load_checkpoint
 from mmcv.utils import get_git_hash
 from mmdet import __version__
 from mmdet.apis import init_random_seed, set_random_seed
@@ -20,10 +20,59 @@ from mmrotate.datasets import build_dataset
 from mmrotate.models import build_detector
 from mmrotate.utils import collect_env, get_root_logger, setup_multi_processes
 
+from mmdet.datasets import CustomDataset
+import random
+
+# For convenience of printing tensor and ndarray shapes when debugging
+import numpy as np
+original_rep = torch.Tensor.__repr__
+torch.Tensor.__repr__ = lambda self: f'Size({list(self.shape)})\n{original_rep(self.data)}'
+
+# For convenience of infering the subset of the whole dataset
+def extract_subset(dataset: CustomDataset, subset_image_list=None, subset_class_list=None, rand_k=None):
+    if subset_image_list is None and rand_k is None:
+        return dataset
+    
+    #subset_class_list = subset_class_list if subset_class_list is not None else dataset.CLASSES
+    
+    subset_idxes = []
+    if subset_image_list is not None:
+        img2idx = {info['filename']:idx for idx, info in enumerate(dataset.data_infos)}
+        for img_name in subset_image_list:
+            idx = img2idx.get(img_name, None)
+            if idx is not None:
+                subset_idxes.append(idx)
+    elif subset_class_list is not None:
+        cls_name2id = {name:id for id, name in enumerate(dataset.get_classes())}
+        cat2imgs = {i: [] for i in range(len(dataset.get_classes()))}
+        for img_id in range(len(dataset)):
+            cat_ids = set(dataset.data_infos[img_id]['ann']['labels'].astype(int).tolist())
+            for cat in cat_ids:
+                cat2imgs[cat].append(img_id)
+        for cls_name in subset_class_list:
+            cls_id = cls_name2id[cls_name]
+            subset_idxes.append(cat2imgs[cls_id])
+        min_num = min([len(cls_idxes) for cls_idxes in subset_idxes])
+        subset_idxes = [random.sample(cls_idxes, min_num) for cls_idxes in subset_idxes]
+        _subset_idxes = []
+        for cls_idxes in subset_idxes:
+             _subset_idxes.extend(cls_idxes)
+        subset_idxes = _subset_idxes
+
+    subset_idxes = subset_idxes if len(subset_idxes) > 0 else list(range(len(dataset)))
+    if rand_k is not None:
+        subset_idxes = random.sample(subset_idxes, min(rand_k, len(subset_idxes)))
+    dataset.data_infos = [dataset.data_infos[idx] for idx in subset_idxes]
+    dataset.img_ids = [*map(lambda x: x['filename'][:-4], dataset.data_infos)]
+    if hasattr(dataset, 'flag'):
+        dataset.flag = dataset.flag[subset_idxes]
+    print(dataset)
+    return dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
-    parser.add_argument('config', help='train config file path')
+    parser.add_argument('config', help='train config file path', default=None)
+    parser.add_argument('--checkpoint', help='checkpoint file')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--resume-from', help='the checkpoint file to resume from')
@@ -72,6 +121,9 @@ def parse_args():
         default='none',
         help='job launcher')
     parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--image_list', nargs='+', default=None)
+    parser.add_argument('--class_list', nargs='+', default=None)
+    parser.add_argument('--rand_k', type=int, default=None)
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -163,9 +215,13 @@ def main():
         cfg.model,
         train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
-    model.init_weights()
+    if args.checkpoint is None:
+        model.init_weights()
+    else:
+        load_checkpoint(model, args.checkpoint, map_location='cpu')
 
     datasets = [build_dataset(cfg.data.train)]
+    datasets = [extract_subset(dataset, args.image_list, args.class_list, args.rand_k) for dataset in datasets]
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)
         val_dataset.pipeline = cfg.data.train.pipeline
