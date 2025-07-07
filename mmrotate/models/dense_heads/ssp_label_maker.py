@@ -476,13 +476,17 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                 labels[index_pos[:, 0]] = gt_labels[index_pos[:, 1]]
 
         # 2. vor-based postive lable-assignment
-        scale=0.25
-        gt_points = gt_points * scale
-        raw_img = ssp_load_raw_image(img_metas, scale=scale, normalize=True)
+        ## scale=0.25
+        ## gt_points = gt_points * scale
+        ## raw_img = ssp_load_raw_image(img_metas, scale=scale, normalize=True)
+        ## 
+        ## h, w = raw_img.shape[:2]
+        ## sp_map, ridge_mask  = self.spatital_partition((h, w), gt_points, gt_labels, sp_thres=self.sp_thres)
+        ## rg_map, rg_pro_map = self.region_growing(sp_map, raw_img, gt_labels, self.num_classes, need_filter=True)
 
-        h, w = raw_img.shape[:2]
-        sp_map, ridge_mask  = self.spatital_partition((h, w), gt_points, gt_labels, sp_thres=self.sp_thres)
-        rg_map, rg_pro_map = self.region_growing(sp_map, raw_img, gt_labels, self.num_classes, need_filter=True)
+        (h, w), sp_map, ridge_mask, rg_map, rg_pro_map = self.ssp_scaled_partition_growing(
+            img_metas, gt_points, gt_labels, work_scale=0.5, base_scale=0.25)
+
         #rg_pro_map = rg_map
 
         # 2.1 Add some postive samples based on partition&growing regions
@@ -507,7 +511,7 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         #### extral visualize code ####
         if self.need_visualize:
             rg_map = torch.where(rg_map > 1, rg_map, sp_map)
-            full_vor_map, _  = self.spatital_partition((h, w), gt_points, gt_labels, dict(pos=[-1.]*num_classes, neg=[-1.]*num_classes))
+            full_vor_map, _  = self.spatital_partition((h, w), gt_points*0.25, gt_labels, dict(pos=[-1.]*num_classes, neg=[-1.]*num_classes))
             empty_map = torch.zeros((h, w), dtype=torch.int32, device=device)
             for k in range(len(gt_points)):
                 radius_mask = dist_sample_and_gt[:h*w, k].reshape((h, w)) < guessed_gt_radius[k]
@@ -525,6 +529,30 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
             img_partition=sp_map,
             img_growing=rg_map,
             ideal_mask=empty_map,)
+
+    def ssp_scaled_partition_growing(self, img_metas, gt_points, gt_labels, work_scale=0.25, base_scale=0.25):
+        """Perform spatial partitioning and region growing on the image at a specified scale."""
+        work_raw_img = ssp_load_raw_image(img_metas, scale=work_scale, normalize=True)
+        
+        scale_ratio = int(work_scale / base_scale)
+        work_h, work_w = work_raw_img.shape[:2]
+        base_h, base_w = work_h // scale_ratio,  work_h // scale_ratio
+
+        sp_map, ridge_mask  = self.spatital_partition((base_h, base_w), gt_points*base_scale, gt_labels, sp_thres=self.sp_thres)
+
+        # resize sp_map and ridge_mask to work_scale
+        work_sp_map = nn.functional.interpolate(
+            sp_map[None, None].float(), size=(work_h, work_w), mode='nearest').squeeze().long()
+        
+        rg_map, rg_pro_map = self.region_growing(work_sp_map, work_raw_img, gt_labels, self.num_classes, need_filter=True)
+
+        # resize work_rg_map and work_rg_pro_map to base_scale
+        rg_map = nn.functional.interpolate(
+            rg_map[None, None].float(), size=(base_h, base_w), mode='nearest').squeeze().long()
+        rg_pro_map = nn.functional.interpolate(
+            rg_pro_map[None, None].float(), size=(base_h, base_w), mode='nearest').squeeze().long()
+
+        return (base_h, base_w), sp_map, ridge_mask, rg_map, rg_pro_map
 
     def spatital_partition(self, img_size, gt_points, gt_labels, sp_thres, conf_map=None, other_ridge=None):
         """
