@@ -129,3 +129,5 @@ work_dirs/**
 datasets/
 pretrained/
 release/
+**cuda**/
+backup/
