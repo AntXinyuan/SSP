@@ -1,6 +1,7 @@
 from mmcv import Config
 from  mmrotate.datasets import *
 import numpy as np
+import argparse
 
 def anno2result(anno: dict, num_classes: int):
     if anno is None or len(anno['bboxes']) == 0:
@@ -29,19 +30,23 @@ def format_results_anno(real_dataset: DOTADataset, pseudo_dataset: DOTADataset):
     
     return real_anno, pseudo_results
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train a detector')
+    parser.add_argument('--dataset-cfg', help='dataset config file path', default='configs/_base_/datasets/dotav1.py')
+    parser.add_argument('--pse-dir', help='pseudo label directory')
+
+    args = parser.parse_args()
+    return args
+
 if __name__ == '__main__':
-    config_file = 'configs/_base_/datasets/dotav1.py'
-    #config_file = 'configs/_base_/datasets/dotav15.py'
-    #config_file = 'configs/_base_/datasets/dotav2.py'
-    cfg = Config.fromfile(config_file)
+    args = parse_args()
+    cfg = Config.fromfile(args.dataset_cfg)
 
     real_cfg = cfg.data.train.copy()
     real_dataset = build_dataset(real_cfg)
     print(real_dataset)
 
-    pse_dir = 'pseudo_labels/ssp_dotav10_hybrid/'
-    #pse_dir = 'pseudo_labels/ssp_dotav15_hybrid/'
-    #pse_dir = 'pseudo_labels/ssp_dotav20_hybrid/'
+    pse_dir = args.pse_dir
     pse_cfg = cfg.data.train.copy()
     pse_cfg['ann_file'] = pse_dir
     pse_dataset = build_dataset(pse_cfg)
