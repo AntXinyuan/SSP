@@ -1,4 +1,4 @@
-export PYTHONPATH=/data/liuxinyuan/SSP:$PYTHONPATH
+export PYTHONPATH=.:$PYTHONPATH
 
 CUDA_VISIBLE_DEVICES=0,1 PORT=6332 bash ./tools/dist_train.sh configs/ssp/rfcos_ssp_dotav10.py 2 
 

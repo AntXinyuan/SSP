@@ -1,4 +1,5 @@
-cd ..
+export PYTHONPATH=.:$PYTHONPATH
+
 CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=7345 bash ./tools/dist_train.sh configs/ssp/orcnn_ssp_dotav10.py 4 
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=7345 bash ./tools/dist_test.sh configs/ssp/orcnn_ssp_dotav10.py \

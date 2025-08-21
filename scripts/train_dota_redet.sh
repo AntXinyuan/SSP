@@ -1,4 +1,4 @@
-cd ..
+export PYTHONPATH=.:$PYTHONPATH
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=6332 bash ./tools/dist_train.sh configs/ssp/redet_ssp_dotav10.py 4 
 
