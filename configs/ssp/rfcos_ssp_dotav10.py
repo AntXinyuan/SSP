@@ -82,8 +82,8 @@ train_pipeline = [
 data = dict(
     samples_per_gpu=4*2,
     train=dict(pipeline=train_pipeline, 
-               version=angle_version, 
-               ann_file='pseudo_labels/ssp_dotav10_hybrid/',),
+               version=angle_version,
+               ann_file='pseudo_labels/release/ssp_dotav10_hybrid/ssp_dotav10_hybrid_2xresolution/',),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 

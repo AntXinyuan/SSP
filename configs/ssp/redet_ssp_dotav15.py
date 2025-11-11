@@ -200,7 +200,7 @@ data = dict(
     samples_per_gpu=2,
     train=dict(pipeline=train_pipeline, 
                version=angle_version,
-               ann_file='pseudo_labels/ssp_dotav15_hybrid/',),
+               ann_file='pseudo_labels/ssp_dotav15_6e/vor_mix/',),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 

@@ -1,12 +1,12 @@
 _base_ = [
-    '../_base_/datasets/dotav15.py', '../_base_/schedules/schedule_1x.py',
+    '../_base_/datasets/dotav1.py', '../_base_/schedules/schedule_1x.py',
     '../_base_/default_runtime.py'
 ]
 angle_version = 'le90'
 classes = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
            'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
            'basketball-court', 'storage-tank', 'soccer-ball-field', 
-           'roundabout', 'harbor', 'swimming-pool', 'helicopter', 'container-crane')
+           'roundabout', 'harbor', 'swimming-pool', 'helicopter')
 
 # model settings
 model = dict(
@@ -36,6 +36,7 @@ model = dict(
         in_channels=256,
         stacked_convs=4,
         feat_channels=256,
+        regress_ranges=((-1, 64), (64, 128), (128, 256), (256, 512), (512, 1e8)),
         strides=[8, 16, 32, 64, 128],
         center_sampling=True,
         center_sample_radius=1.5,
@@ -83,7 +84,7 @@ data = dict(
     samples_per_gpu=4,
     train=dict(pipeline=train_pipeline, 
                version=angle_version, 
-               ann_file='pseudo_labels/ssp_dotav15_6e/vor_mix/',),
+               ann_file='pseudo_labels/release/ssp_dotav10_hybrid/ssp_dotav10_hybrid_2xresolution/',),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 

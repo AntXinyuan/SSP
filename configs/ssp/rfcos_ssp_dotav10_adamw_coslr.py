@@ -1,12 +1,12 @@
 _base_ = [
-    '../_base_/datasets/dotav15.py', '../_base_/schedules/schedule_1x.py',
+    '../_base_/datasets/dotav1.py', '../_base_/schedules/schedule_1x.py',
     '../_base_/default_runtime.py'
 ]
 angle_version = 'le90'
 classes = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
            'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
            'basketball-court', 'storage-tank', 'soccer-ball-field', 
-           'roundabout', 'harbor', 'swimming-pool', 'helicopter', 'container-crane')
+           'roundabout', 'harbor', 'swimming-pool', 'helicopter')
 
 # model settings
 model = dict(
@@ -55,7 +55,10 @@ model = dict(
         loss_centerness=dict(
             type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)),
     # training and testing settings
-    train_cfg=None,
+    train_cfg=dict(
+        store_dir='work_dirs/ssp_label_marker/',
+        visualize_dir=None,
+        pseudo_label_dir=None,),
     test_cfg=dict(
         nms_pre=2000,
         min_bbox_size=0,
@@ -80,13 +83,30 @@ train_pipeline = [
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
 ]
 data = dict(
-    samples_per_gpu=4,
+    samples_per_gpu=4*2,
     train=dict(pipeline=train_pipeline, 
-               version=angle_version, 
-               ann_file='pseudo_labels/ssp_dotav15_6e/vor_mix/',),
+               version=angle_version,
+               ann_file='pseudo_labels/release/ssp_dotav10_hybrid/ssp_dotav10_hybrid_2xresolution/',),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(lr=0.0025*4) # 0.0025 * 4
+optimizer=dict(
+    _delete_=True,
+    type='AdamW',
+    lr=0.00005*4,
+    betas=(0.9, 0.999),
+    weight_decay=0.005)
+
+lr_config = dict(
+    _delete_=True,
+    policy='FlatCosineAnnealing',
+    warmup='linear',
+    warmup_iters=500,
+    warmup_ratio=1.0 / 3,
+    start_percent= 0.25,
+    min_lr_ratio= 0.01,)
+
+custom_hooks = [dict(type='RecordEpochIterHook')]
+find_unused_parameters = True
 
 # this config is for 2 gpus, where total_bs=4*2*2=16, total_lr=0.01, total_iter_per_batch=800

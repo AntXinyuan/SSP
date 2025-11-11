@@ -4,10 +4,12 @@ _base_ = [
 ]
 
 angle_version = 'le90'
-classes = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
-           'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
-           'basketball-court', 'storage-tank', 'soccer-ball-field', 
-           'roundabout', 'harbor', 'swimming-pool', 'helicopter')
+classes = ('airplane', 'airport', 'baseballfield', 'basketballcourt',
+           'bridge', 'chimney', 'expressway-service-area',
+           'expressway-toll-station', 'dam', 'golffield',
+           'groundtrackfield', 'harbor', 'overpass', 'ship', 'stadium',
+           'storagetank', 'tenniscourt', 'trainstation', 'vehicle',
+           'windmill')
 model = dict(
     type='ReDet',
     backbone=dict(
@@ -185,7 +187,7 @@ img_norm_cfg = dict(
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
-    dict(type='RResize', img_scale=(1024, 1024)),
+    dict(type='RResize', img_scale=(800, 800)),
     dict(
         type='RRandomFlip',
         flip_ratio=[0.25, 0.25, 0.25],
@@ -197,10 +199,10 @@ train_pipeline = [
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
 ]
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=4*2,
     train=dict(pipeline=train_pipeline, 
                version=angle_version,
-               ann_file='pseudo_labels/release/ssp_dotav10_hybrid/ssp_dotav10_hybrid_2xresolution/',),
+               pse_ann_dir='pseudo_labels/ssp_dior-real-ep6/vor_mix/',),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 

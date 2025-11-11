@@ -13,17 +13,26 @@
             "justMyCode": false,
             "args": [
                 //"configs/ssp/rfcos_ssp_dotav10.py",
-                //"configs/ssp/ssp_label_marker.py",
-                "--checkpoint", "work_dirs/ssp_label_marker/epoch_5.pth",
+                //"--checkpoint", "work_dirs/release/2xresolution/ssp_label_marker/epoch_5.pth",
+                //"configs/rotated_fcos/rotated_fcos_r50_fpn_1x_dota_le90.py",
+                //"configs/ssp/ssp_label_marker_v2.py",
+                //"--checkpoint", "work_dirs/ssp_label_marker_v2/epoch_12.pth",
+                //"configs/ssp/rfcos_ssp_dotav10_adamw_coslr.py",
+                //"--checkpoint", "work_dirs/rfcos_ssp_dotav10_adamw_coslr/epoch_12.pth",
+                "configs/ssp/ssp_label_marker_dior.py",
+                "--checkpoint", "work_dirs/ssp_label_marker_dior-raw/epoch_6.pth",
                 //"--resume", "work_dirs/ssp_label_marker/epoch_5.pth",
                 "--seed", "2423",
                 "--no-validate",
-                //"--rand_k", "20",
-                "--image_list", 
-                "P1464__1024__0___0.png",
-                "P0734__1024__0___0.png",
-                "P0858__1024__824___441.png",
-                "P1387__1024__0___2472.png", 
+                //"--rand_k", "100",
+                //"--image_list", 
+                //"P1464__1024__0___0.png",
+                //"P0734__1024__0___0.png",
+                //"P0858__1024__824___441.png",
+                //"P1387__1024__0___2472.png", 
+                "--class_list","windmill",
+                //"expressway-toll-station", "dam", "windmill",
+                //"airplane", "large-vehicle", "ship", "harbor", "storage-tank",
                 "--cfg-options",
                 "optimizer.lr=0.0",
                 "runner.max_epochs=1",
@@ -31,12 +40,12 @@
                 "checkpoint_config.interval=-1",
                 "checkpoint_config.save_last=False",
                 "model.bbox_head.is_record_stage=True",
-                "model.train_cfg.visualize_dir=vis/4imgs", 
-                //"model.train_cfg.pseudo_label_dir=pseudo_labels/test-labels"
+                "model.train_cfg.visualize_dir=vis/ssp_label_marker_dior-real-ep6-wm", 
+                //"model.train_cfg.pseudo_label_dir=pseudo_labels/rfocs_stage1.5"
             ],
             "env": {
                 "PYTHONPATH": "${workspaceFolder}",
-                "CUDA_VISIBLE_DEVICES": "3"
+                "CUDA_VISIBLE_DEVICES": "0"
             },       
         },
         {
@@ -68,8 +77,8 @@
             "request": "launch",
             "program": "tools/model_converters/publish_model.py",
             "args": [
-                "pretrained/ssp_epoch_5.pth",
-                "pretrained/ssp_labelmarker_dotav10.pth"
+                "pretrained/ssp_0327b_epoch_5.pth",
+                "pretrained/ssp_labelmarker_dotav10_old.pth",
             ],
             "env": {
                 "PYTHONPATH": "${workspaceFolder}",
@@ -78,5 +87,58 @@
             "justMyCode": false,
             "console": "integratedTerminal",
         },
+        {
+            "name": "Single Test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/test.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                //"configs/ssp/rfcos_ssp_dotav10.py",
+                //"configs/rotated_fcos/rotated_fcos_r50_fpn_1x_dota_le90.py",
+                "configs/ssp/ssp_label_marker_v2.py",
+                "work_dirs/ssp_label_marker_v2/epoch_12.pth",
+                //"--resume", "work_dirs/ssp_label_marker/epoch_5.pth",
+                "--show", "--show-dir", "vis_results/ssp_label_marker_v2-val-ep12-0911",
+                "--rand_k", "100",
+                "--subset", "val",
+                //"--image_list", 
+                //"P1464__1024__0___0.png",
+                //"P0734__1024__0___0.png",
+                //"P0858__1024__824___441.png",
+                //"P1387__1024__0___2472.png", 
+                //"--class_list",
+                //"plane", "large-vehicle", "ship", "harbor", "storage-tank",
+                //"--cfg-options",
+                //"optimizer.lr=0.0",
+                //"runner.max_epochs=1",
+                //"log_config.interval=1",
+                //"checkpoint_config.interval=-1",
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "2"
+            },       
+        },
+        {
+            "name": "Eval Lables",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/eval_pseudo_annotations.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                //"--dataset-cfg", "configs/_base_/datasets/dotav1.py",
+                //"--pse-dir", "pseudo_labels/release/ssp_dotav10_hybrid/ssp_dotav10_hybrid_2xresolution/",
+                //"--pse-dir", "pseudo_labels/ssp_v2_dotav10_2xresolution_ep5/ssp_hybrid",
+                "--dataset-cfg", "configs/_base_/datasets/dior.py",
+                "--pse-dir", "pseudo_labels/ssp_dior/vor_mix"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "0"
+            },       
+        }
     ]
 }
