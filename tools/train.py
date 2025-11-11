@@ -26,7 +26,7 @@ import random
 # For convenience of printing tensor and ndarray shapes when debugging
 import numpy as np
 original_rep = torch.Tensor.__repr__
-torch.Tensor.__repr__ = lambda self: f'Size({list(self.shape)})\n{original_rep(self.data)}'
+torch.Tensor.__repr__ = lambda self: f'Size({list(self.shape)}) Type({self.dtype})\n{original_rep(self.data)}\n'
 
 # For convenience of infering the subset of the whole dataset
 def extract_subset(dataset: CustomDataset, subset_image_list=None, subset_class_list=None, rand_k=None):
@@ -246,3 +246,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    print('\n')

@@ -571,8 +571,9 @@ class RBox2PointWithNoise:
             the item in `results`, the value is the destination box type.
     """
 
-    def __init__(self, p=0.1) -> None:
+    def __init__(self, p=0.1, max_size=(1024, 1024)) -> None:
         self.p = p
+        self.max_size = max_size
         pass
 
     def __call__(self, results: dict) -> dict:
@@ -589,4 +590,9 @@ class RBox2PointWithNoise:
         results['gt_bboxes'][:, 3] = 0.1
         results['gt_bboxes'][:, 4] = 0
 
+        # Clip the boxes to the image boundaries
+        results['gt_bboxes'][:, 0] = np.clip(
+            results['gt_bboxes'][:, 0], 0, self.max_size[1] - 1)
+        results['gt_bboxes'][:, 1] = np.clip(
+            results['gt_bboxes'][:, 1], 0, self.max_size[0] - 1)
         return results

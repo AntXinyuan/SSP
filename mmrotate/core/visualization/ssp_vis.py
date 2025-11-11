@@ -7,7 +7,61 @@ import cv2
 import mmcv
 from mmrotate.core.visualization import imshow_det_rbboxes
 
-            
+def ssp_visualize_single_simple(vis_results, img_metas, dataset, output_dir, scale=0.25, need_print=False):
+    """
+    Visualizes the results of a single SSP sample, including ground truth and predicted bounding boxes, CPM (Class Probability Map) targets and predictions, and various intermediate visualizations.
+    Args:
+        vis_results (dict): Dictionary containing various intermediate and final results for visualization, such as predicted boxes, labels, CPM masks, partitions, and metrics.
+        img_metas (dict): Metadata for the image, including file path, image shape, and padding information.
+        dataset (object): Dataset object or identifier used to retrieve class names and color palettes for visualization.
+        output_dir (str): Directory where the visualization output image will be saved.
+        scale (float, optional): Scaling factor for resizing images and bounding boxes. Default is 0.25.
+    Returns:
+        None. The function saves the visualization image to the specified output directory and prints the output path.
+        
+    Notes:
+        - The function creates a composite visualization image showing: 
+            7)pse_boxes*
+        - Supporting vis_results keys include:
+            - `pse_boxes_*`: Additional predicted boxes for visualization.
+        - The output image includes a caption summarizing the metrics and the content of each visualization panel.
+    """
+    # img_with_gt_boxes, img_with_cpm_target, img_with_cpm_pred,
+    # cls_cpm, cls_cpm_mask, cls_cpm_boxes
+    # gt_boxes, gt_pts, gt_pts_with_parttion, gt_pts_with_growing
+    # pse_boxes_ssp_hybrid, pse_boxes_gt 
+
+    box_scale = np.array([scale, scale, scale, scale, 1.0]).reshape(1, 5)
+    
+    # 0. prepare image
+    image_name = os.path.basename(img_metas['filename'])
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, image_name)
+    image = ssp_load_raw_image(img_metas, scale=scale)
+
+    CLASSES, PALETTE = get_visualize_database(dataset)
+
+    visualize_results = []
+    num_basic_results = len(visualize_results)
+        
+    #metric_text = ','.join([f'{k}:{v:4.2f}' for k, v in vis_results['metric'].items()])
+    visualize_caption = f'[{image_name}] '
+        
+    for idx, (field_name, extra_bboxes) in enumerate(filter(lambda x: x[0].find('pse_boxes_') != -1, vis_results.items())):
+        extra_bboxes = extra_bboxes * box_scale
+        img_with_pse_boxes = imshow_det_rbboxes(image, extra_bboxes, vis_results['pse_labels'], bbox_color=PALETTE, show_text=False)
+        pse_boxes = imshow_det_rbboxes(255*np.ones_like(image), extra_bboxes, vis_results['pse_labels'], bbox_color=PALETTE, show_text=False)
+        visualize_results.append(pse_boxes)
+        visualize_results.append(img_with_pse_boxes)
+        visualize_caption += f', {idx+num_basic_results}){field_name}'
+
+    result_image = matrix_concat_images(visualize_results, cols=8)
+    result_image = add_caption_to_image(result_image, visualize_caption)
+    mmcv.imwrite(result_image, output_path)
+    if need_print:
+        print(f'Visualize {image_name} with {len(visualize_results)} results, saved to {output_path}')
+
+
 def ssp_visualize_single(vis_results, img_metas, dataset, output_dir, scale=0.25, need_print=False):
     """
     Visualizes the results of a single SSP sample, including ground truth and predicted bounding boxes, CPM (Class Probability Map) targets and predictions, and various intermediate visualizations.
