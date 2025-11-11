@@ -5,13 +5,18 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import copy
 
+from mmcv.cnn import Scale
 from mmcv.runner import force_fp32
 from mmdet.core import multi_apply, reduce_mean
+from mmrotate.core import build_bbox_coder, multiclass_nms_rotated
+from mmrotate.models import build_loss
 
 from ..builder import ROTATED_HEADS
-from .rotated_fcos_head import RotatedFCOSHead
-from .utils import DistanceMap, watershed_segmentation
+from .rotated_fcos_head import RotatedFCOSHead, RotatedAnchorFreeHead
+from .utils import DistanceMap, watershed_segmentation, mask_rbox_iou, rbox_to_mid_points, compute_topk_loss
 
 from mmrotate.core.evaluation import eval_rbox_single_image
 from mmrotate.core.visualization import (
@@ -24,7 +29,7 @@ from mmrotate.core.visualization import (
 INF = 1e8
 
 @ROTATED_HEADS.register_module()
-class SSPLabelMarkerHead(RotatedFCOSHead):
+class SSPLabelMarkerV2Head(RotatedFCOSHead):
     """
     A specialized head for point-supervised pseudo-label generation in rotated object detection.
     Inherits from RotatedFCOSHead and extends functionality for handling spatial partitioning,
@@ -89,12 +94,16 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                     confidence=(0.05, 0.6, 0.95)),
                  is_record_stage=False,
                  use_single_scale=False,
+                 angle_coder=dict(type='ACMCoder'),
+                 loss_angle=dict(type='SmoothL1Loss', beta=1.0/9.0, loss_weight=1.0),
+                 loss_mask=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=1.0),
                  *args, **kwargs):
         self.cls_square = cls_square
         self.cls_overlap = cls_overlap
         self.cls_merge = cls_merge
         self.cls_stable = cls_stable
         self.use_single_scale = use_single_scale
+        self.angle_coder = build_bbox_coder(angle_coder)
 
         super().__init__(*args, **kwargs)
 
@@ -118,11 +127,47 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                     neg_thres[cls_id] = cls_neg
         self.sp_thres = dict(pos=pos_thres, neg=neg_thres, conf=conf_thres)
 
+        self.cls_mapping = list(range(self.num_classes))
+        for big_id, small_ids in enumerate(cls_merge):
+            for small_id in small_ids:
+                self.cls_mapping[small_id] = big_id
+
+        self.loss_mask = build_loss(loss_mask)
+        self.loss_angle = build_loss(loss_angle) if loss_angle is not None else None
+
+    @property
+    def use_ssp_bboxes(self):
+        return False
+        #return self.runner_info['epoch'] >= self.runner_info['max_epochs'] // 2
+
     def _init_layers(self):
         """Initialize layers of the head."""
-        super()._init_layers()
+        super(RotatedAnchorFreeHead, self)._init_layers()
+
+        self.conv_centerness = nn.Conv2d(self.feat_channels, 1, 3, padding=1)
+        self.conv_angle = nn.Conv2d(self.feat_channels, self.angle_coder.encode_size, 3, padding=1)
+        self.scales = nn.ModuleList([Scale(1.0) for _ in self.strides])
+
+        self.mask_convs = copy.deepcopy(self.cls_convs)
+        self.conv_mask = copy.deepcopy(self.conv_cls)
+        #if self.is_scale_angle:
+        #    self.scale_angle = Scale(1.0)
         # Remove unused conv moudles
-        self.reg_convs = self.conv_reg = self.conv_centerness = self.conv_angle = self.scale_angle = self.scales = None
+        # self.scale_angle = None
+        #self.conv_angle = nn.Conv2d(self.feat_channels, self.angle_coder.encode_size, 3, padding=1)
+
+        #self.template_embed = nn.Embedding(self.num_classes, self.feat_channels)
+        #self.template_mlp = nn.Sequential(
+        #    nn.Linear(self.feat_channels*2, self.feat_channels),
+        #    nn.ReLU(inplace=True),
+        #    nn.Linear(self.feat_channels, 2)
+        #)
+        ##
+        #self.resolution_predictor = nn.Sequential(
+        #    nn.Linear(self.feat_channels, self.feat_channels),
+        #    nn.ReLU(inplace=True),
+        #    nn.Linear(self.feat_channels, 1)
+        #)
 
     def forward(self, feats):
         """Forward features from the upstream network.
@@ -142,18 +187,18 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                 centernesses (list[Tensor]): centerness for each scale level, \
                     each is a 4D-tensor, the channel number is num_points * 1.
         """
-        feats = list(feats)
-        #@# if self.use_single_scale:
-        #@#     feats, scales, strides = [feats[0],], [self.scales[0],], [self.strides[0],]
-        #@# else:
-        #@#     feats, scales, strides = feats, self.scales, self.strides
-        #@# cls_score, = multi_apply(self.forward_single, feats, scales, strides)
+        #_feats, scales, strides = ([feats[0]], [self.scales[0]], [self.strides[0]])  if self.use_single_scale else (feats, self.scales, self.strides)
+        mask_scores = [self.forward_mask(feats[0]),]
+        cls_scores, bbox_preds, angle_preds, centernesses = multi_apply(self.forward_single, feats[1:], self.scales, self.strides)
+        return mask_scores, cls_scores, bbox_preds, angle_preds, centernesses
 
-        feats = [feats[0],] if self.use_single_scale else feats
-        cls_score, = multi_apply(self.forward_single, feats)
-        return cls_score,
+    def forward_mask(self, mask_feat):
+        for cls_layer in self.mask_convs:
+            mask_feat = cls_layer(mask_feat)
+        mask_score = self.conv_mask(mask_feat)
+        return mask_score
 
-    def forward_single(self, x):
+    def forward_single(self, x, scale, stride):
         """Forward features of a single scale level.
 
         Args:
@@ -168,43 +213,60 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                 and centerness predictions of input feature maps.
         """
         cls_feat = x
-        #@# reg_feat = x
+        reg_feat = x
 
         for cls_layer in self.cls_convs:
             cls_feat = cls_layer(cls_feat)
         cls_score = self.conv_cls(cls_feat)
 
-        #@# for reg_layer in self.reg_convs:
-        #@#     reg_feat = reg_layer(reg_feat)
-        #@# bbox_pred = self.conv_reg(reg_feat)
-        #@# 
-        #@# if self.centerness_on_reg:
-        #@#     centerness = self.conv_centerness(reg_feat)
-        #@# else:
-        #@#     centerness = self.conv_centerness(cls_feat)
-        #@# # scale the bbox_pred of different level
-        #@# # float to avoid overflow when enabling FP16
-        #@# bbox_pred = scale(bbox_pred).float()
-        #@# if self.norm_on_bbox:
-        #@#     # bbox_pred needed for gradient computation has been modified
-        #@#     # by F.relu(bbox_pred) when run with PyTorch 1.10. So replace
-        #@#     # F.relu(bbox_pred) with bbox_pred.clamp(min=0)
-        #@#     bbox_pred = bbox_pred.clamp(min=0)
-        #@#     if not self.training:
-        #@#         bbox_pred *= stride
-        #@# else:
-        #@#     bbox_pred = bbox_pred.exp()
-        #@# angle_pred = self.conv_angle(reg_feat)
-        #@# if self.is_scale_angle:
-        #@#     angle_pred = self.scale_angle(angle_pred).float()
+        for reg_layer in self.reg_convs:
+            reg_feat = reg_layer(reg_feat)
+        bbox_pred = self.conv_reg(reg_feat)
+ 
+        if self.centerness_on_reg:
+            centerness = self.conv_centerness(reg_feat)
+        else:
+            centerness = self.conv_centerness(cls_feat)
+        # scale the bbox_pred of different level
+        # float to avoid overflow when enabling FP16
+        bbox_pred = scale(bbox_pred).float()
+        if self.norm_on_bbox:
+            # bbox_pred needed for gradient computation has been modified
+            # by F.relu(bbox_pred) when run with PyTorch 1.10. So replace
+            # F.relu(bbox_pred) with bbox_pred.clamp(min=0)
+            bbox_pred = bbox_pred.clamp(min=0)
+            if not self.training:
+                bbox_pred *= stride
+        else:
+            bbox_pred = bbox_pred.exp()
+        angle_pred = self.conv_angle(reg_feat)
+        #if self.is_scale_angle:
+        #    angle_pred = self.scale_angle(angle_pred).float()
+        return cls_score, bbox_pred, angle_pred, centerness
 
-        return cls_score,
+    def get_template(self, ins_boxes, ins_labels, feat):
 
-     
+        feat = torch.stack([F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feat]).mean(0)
+        glo_scale = self.resolution_predictor(feat).exp()
+
+        num_gts = [len(ins) for ins in ins_labels]
+        label_feat = self.template_embed(torch.concat(ins_labels)) # (N, D)
+        box_feat = label_feat # (N, D)
+
+        tmp_scale = self.template_mlp(torch.concat([label_feat, box_feat], dim=-1)) # (N, 2 )
+
+        tmp_scale = torch.split(tmp_scale, num_gts, dim=0)
+
+        return glo_scale, tmp_scale
+
     @force_fp32(
-        apply_to=('cls_scores',))
-    def loss(self,
-             cls_scores,
+        apply_to=('cls_scores', 'bbox_preds', 'angle_preds', 'centernesses'))
+    def loss(self, 
+             mask_scores,
+             cls_scores, 
+             bbox_preds, 
+             angle_preds, 
+             centernesses,
              gt_bboxes,
              gt_labels,
              img_metas,
@@ -231,28 +293,138 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
         """
-        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
+        featmap_sizes = [featmap.size()[-2:] for featmap in [*mask_scores, *cls_scores]]
 
         if self.use_single_scale:
             single_level_points = self.prior_generator.single_level_grid_priors(
                 featmap_sizes[0],
                 level_idx=0,
-                dtype=cls_scores[0].dtype,
-                device=cls_scores[0].device,
-                with_stride=True)
-            all_level_points, cls_scores = [single_level_points,], [cls_scores[0],]
+                dtype=mask_scores[0].dtype,
+                device=mask_scores[0].device)
+            all_level_points, mask_scores = [single_level_points,], [mask_scores[0],]
         else:
             all_level_points = self.prior_generator.grid_priors(
                 featmap_sizes,
-                dtype=cls_scores[0].dtype,
-                device=cls_scores[0].device,
-                with_stride=True)
-        
-        loss_mask, extra_results_mask = self.loss_mask(cls_scores, all_level_points, gt_bboxes, gt_labels, img_metas)
-            
-        return dict(**loss_mask,)
+                dtype=mask_scores[0].dtype,
+                device=mask_scores[0].device)
 
-    def loss_mask(self, cls_scores, priors_all_lvl, gt_bboxes, gt_labels, img_metas):
+        glo_scale, tmp_scale = None, None#self.get_template(gt_bboxes, gt_labels, feats)
+        #feats = None
+
+        _targets = self.get_targets(mask_scores, all_level_points, gt_bboxes, gt_labels, img_metas)
+        concat_lvl_mask_labels, concat_lvl_inst_labels, concat_lvl_bboxes, concat_lvl_angles, extra_results_list = _targets
+        
+        loss_mask = self.loss_mask_cls(mask_scores, 
+                           targets=(concat_lvl_mask_labels,))
+        
+        loss_cls = self.loss_inst_cls(cls_scores, 
+                                   targets=(concat_lvl_inst_labels,))
+
+        loss_inst = self.loss_inst_box(bbox_preds, angle_preds, centernesses, all_level_points[1:],
+                                   targets=(concat_lvl_inst_labels, concat_lvl_bboxes, concat_lvl_angles, glo_scale, tmp_scale))
+            
+        loss_dict = dict(**loss_mask, **loss_cls, **loss_inst)
+        if self.is_record_stage:
+            loss_dict = {k: v*0.0 for k, v in loss_dict.items()}
+        return loss_dict
+
+    def loss_inst_box(self, bbox_preds, angle_preds, centernesses, priors_all_lvl, targets):
+        all_level_points = priors_all_lvl
+        cls_labels, bbox_targets, angle_targets, glo_scale, tmp_scale = targets
+
+        num_imgs = bbox_preds[0].size(0)
+        # flatten cls_scores, bbox_preds and centerness
+
+        flatten_bbox_preds = [
+            bbox_pred.permute(0, 2, 3, 1).reshape(-1, 4)
+            for bbox_pred in bbox_preds
+        ]
+        flatten_angle_preds = [
+            angle_pred.permute(0, 2, 3, 1).reshape(-1, self.angle_coder.encode_size)
+            for angle_pred in angle_preds
+        ]
+        flatten_centerness = [
+            centerness.permute(0, 2, 3, 1).reshape(-1)
+            for centerness in centernesses
+        ]
+        flatten_bbox_preds = torch.cat(flatten_bbox_preds)
+        flatten_angle_preds = torch.cat(flatten_angle_preds)
+        flatten_centerness = torch.cat(flatten_centerness)
+
+        flatten_cls_labels = torch.cat(cls_labels)
+        flatten_bbox_targets = torch.cat(bbox_targets)
+        flatten_angle_targets = torch.cat(angle_targets)
+        # repeat points to align with bbox_preds
+        flatten_points = torch.cat(
+            [points.repeat(num_imgs, 1) for points in all_level_points])
+
+        # FG cat_id: [0, num_classes -1], BG cat_id: num_classes
+        bg_class_ind = self.num_classes
+        pos_inds = ((flatten_cls_labels >= 0)
+                    & (flatten_cls_labels < bg_class_ind)).nonzero().reshape(-1)
+        num_pos = torch.tensor(
+            len(pos_inds), dtype=torch.float, device=bbox_preds[0].device)
+        num_pos = max(reduce_mean(num_pos), 1.0)
+
+        pos_bbox_preds = flatten_bbox_preds[pos_inds]
+        pos_angle_preds = flatten_angle_preds[pos_inds]
+        pos_centerness = flatten_centerness[pos_inds]
+        pos_bbox_targets = flatten_bbox_targets[pos_inds]
+        pos_angle_targets = flatten_angle_targets[pos_inds]
+        pos_centerness_targets = self.centerness_target(pos_bbox_targets)
+        # centerness weighted iou loss
+        centerness_denorm = max(
+            reduce_mean(pos_centerness_targets.sum().detach()), 1e-6)
+
+        if len(pos_inds) > 0:
+            pos_points = flatten_points[pos_inds]
+            if self.separate_angle:
+                bbox_coder = self.h_bbox_coder
+            else:
+                bbox_coder = self.bbox_coder
+                pos_decoded_angle_preds = self.angle_coder.decode(pos_angle_preds, keepdim=True)
+                pos_bbox_preds = torch.cat([pos_bbox_preds, pos_decoded_angle_preds],
+                                           dim=-1)
+                pos_bbox_targets = torch.cat(
+                    [pos_bbox_targets, pos_angle_targets], dim=-1)
+            pos_decoded_bbox_preds = bbox_coder.decode(pos_points,
+                                                       pos_bbox_preds)
+            
+            #pos_ins_labels = flatten_ins_labels[pos_inds]
+            #pos_tmp_scale = tmp_scale[pos_ins_labels]
+
+            #pos_decoded_bbox_preds[..., 2:4] = (pos_tmp_scale + pos_decoded_bbox_preds[..., 2:4]) * glo_scale
+
+            pos_decoded_target_preds = bbox_coder.decode(
+                pos_points, pos_bbox_targets)
+            #centerness_denorm = max(reduce_mean(pos_centerness_targets.sum().detach()), 1e-6)
+            loss_bbox = self.loss_bbox(
+                pos_decoded_bbox_preds,
+                pos_decoded_target_preds,
+                weight=pos_centerness_targets,
+                #avg_factor=centerness_denorm)
+                reduction_override='none',)
+            loss_bbox = compute_topk_loss(loss_bbox, weight=pos_centerness_targets, topk_ratio=0.95)
+            
+            if self.loss_angle is not None:
+                pos_angle_targets = self.angle_coder.encode(pos_angle_targets)
+                loss_angle = self.loss_angle(
+                    pos_angle_preds, pos_angle_targets, reduction_override='none')
+                loss_angle = compute_topk_loss(loss_angle, weight=pos_centerness_targets, topk_ratio=0.95)
+            else:
+                loss_angle = pos_angle_preds.sum() * 0.0
+
+            loss_centerness = self.loss_centerness(
+                pos_centerness, pos_centerness_targets, avg_factor=num_pos)
+            
+        else:
+            loss_bbox = pos_bbox_preds.sum()
+            loss_angle = pos_angle_preds.sum()
+            loss_centerness = pos_centerness.sum()
+
+        return dict(loss_bbox=loss_bbox, loss_angle=loss_angle, loss_centerness=loss_centerness)
+
+    def loss_inst_cls(self, cls_scores, targets):
         """ Compute the loss for point-supervised mask learning.
         Args:
             cls_scores (list[Tensor]): List of classification scores for each 
@@ -268,8 +440,7 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         Returns:
             dict: A dictionary of loss components.
         """
-        cls_labels_target, extra_results_list = self.get_targets_mask(
-            cls_scores, priors_all_lvl, gt_bboxes, gt_labels, img_metas)
+        cls_labels_target, = targets
         
         # 1. prepare loss_cls
         flatten_cls_scores = [
@@ -291,15 +462,59 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
             len(avail_inds), dtype=torch.float, device=cls_scores[0].device)
         num_avail = max(reduce_mean(num_avail), 1.0)
         
+        #flatten_labels[flatten_labels < 0] = self.num_classes
         loss_cls = self.loss_cls(
-            flatten_cls_scores[avail_inds], flatten_labels[avail_inds], avg_factor=num_avail)
+            flatten_cls_scores, flatten_labels, avg_factor=num_pos)
+        #loss_cls = compute_topk_loss(loss_cls, avg_factor=num_avail, topk_ratio=None)
         
-        # 2. collect loss_cls
-        factor = 0.0 if self.is_record_stage else 1.0
-
-        return dict(loss_cls=loss_cls*factor), extra_results_list
+        return dict(loss_cls=loss_cls)
     
-    def get_targets_mask(self, cls_scores, priors_all_lvl, gt_bboxes_list, gt_labels_list, img_metas):
+    def loss_mask_cls(self, cls_scores, targets):
+        """ Compute the loss for point-supervised mask learning.
+        Args:
+            cls_scores (list[Tensor]): List of classification scores for each 
+                feature level, each with shape (num_imgs, num_cls, h, w).
+            prior_all_lvl (list[Tensor]): List of prior points of each fpn level, 
+                each has shape (num_points, 4).
+            gt_bboxes (list[Tensor]): Ground truth bounding boxes for each image, 
+                each with shape (num_gts, 2/4/5).
+            gt_labels (list[Tensor]): Ground truth labels for each image, 
+                each with shape (num_gts,).
+            img_metas (list[dict]): List of image meta information, each containing 
+                'img_shape' key with shape (height, width, 3).
+        Returns:
+            dict: A dictionary of loss components.
+        """
+        cls_labels_target, = targets
+        
+        # 1. prepare loss_cls
+        flatten_cls_scores = [
+            cls_score.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
+            for cls_score in cls_scores]
+        flatten_cls_scores = torch.cat(flatten_cls_scores)
+        flatten_labels = cls_labels_target[0]#torch.cat(cls_labels_target)
+
+        # FG cat_id: [0, num_classes -1], BG cat_id: num_classes
+        bg_class_ind = self.num_classes
+        pos_inds = ((flatten_labels >= 0)
+                    & (flatten_labels < bg_class_ind)).nonzero().reshape(-1)
+        num_pos = torch.tensor(
+            len(pos_inds), dtype=torch.float, device=cls_scores[0].device)
+        num_pos = max(reduce_mean(num_pos), 1.0)
+        
+        avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
+        num_avail = torch.tensor(
+            len(avail_inds), dtype=torch.float, device=cls_scores[0].device)
+        num_avail = max(reduce_mean(num_avail), 1.0)
+        
+        #flatten_labels[flatten_labels < 0] = self.num_classes
+        loss_mask = self.loss_mask(
+            flatten_cls_scores, flatten_labels, avg_factor=num_pos)
+        #loss_cls = compute_topk_loss(loss_cls, avg_factor=num_avail, topk_ratio=None)
+        
+        return dict(loss_mask=loss_mask)
+
+    def get_targets(self, cls_scores, priors_all_lvl, gt_bboxes_list, gt_labels_list, img_metas):
         """Generate targets for point-supervised mask learning.
         Args:
             cls_scores (list[Tensor]): Box scores for each scale level
@@ -316,7 +531,15 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
             concat_lvl_labels (list[Tensor]): Concatenated labels for each level, 
             extra_results_list (list[Tensor]): Extra results for each image, 
         """
-        concat_points = torch.cat(priors_all_lvl, dim=0)
+        num_levels = len(priors_all_lvl)
+        # expand regress ranges to align with points
+        expanded_regress_ranges = [
+            priors_all_lvl[i].new_tensor(self.regress_ranges[i])[None].expand_as(
+                priors_all_lvl[i]) for i in range(num_levels)
+        ]
+        # concat all levels points and regress ranges
+        concat_regress_ranges = torch.cat(expanded_regress_ranges, dim=0)
+        #concat_points = torch.cat(priors_all_lvl, dim=0)
 
         # the number of points per img, per lvl
         num_points = [center.size(0) for center in priors_all_lvl]
@@ -334,14 +557,25 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         cls_scores_img_lvl = lvl2img(cls_scores)
         
         # get labels and bbox_targets of each image
-        labels_list, extra_results_list = multi_apply(
+        mask_labels_list, extra_results_list = multi_apply(
             self._get_target_mask_single,
             gt_bboxes_list,
             gt_labels_list,
             cls_scores_img_lvl,
             img_metas,
-            points=concat_points,
-            num_points_per_lvl=num_points)
+            points=priors_all_lvl[0],
+            num_points_per_lvl=num_points[0:1])
+        
+        # get labels and bbox_targets of each image
+        inst_labels_list, bbox_targets_list, angle_targets_list = multi_apply(
+            self._get_target_inst_single,
+            #[results['pse_gt_boxes'] for results in extra_results_list],
+            #[results['pse_gt_labels'] for results in extra_results_list],
+            gt_bboxes_list,
+            gt_labels_list,
+            points=torch.cat(priors_all_lvl[1:], dim=0),
+            regress_ranges=torch.cat(expanded_regress_ranges[1:], dim=0),
+            num_points_per_lvl=num_points[1:])
 
         def img2lvl(data_list, num_data_per_lvl):
             num_levels = len(num_data_per_lvl)
@@ -354,10 +588,95 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
             
             return concat_lvl_data
         
-        concat_lvl_labels = img2lvl(labels_list, num_points)
-        
-        return concat_lvl_labels, extra_results_list
+        concat_lvl_mask_labels = img2lvl(mask_labels_list, num_points[0:1])
+        concat_lvl_inst_labels = img2lvl(inst_labels_list, num_points[1:])
+        concat_lvl_bboxes = img2lvl(bbox_targets_list, num_points[1:])
+        concat_lvl_angles = img2lvl(angle_targets_list, num_points[1:])
 
+        if self.norm_on_bbox:
+            for lvl in range(num_levels-1):
+                concat_lvl_bboxes[lvl] = concat_lvl_bboxes[lvl] / self.strides[lvl+1]
+
+        #if self.use_mix_labels and num_levels == 6:
+        #    for lvl in range(1, num_levels):
+        #        concat_lvl_mask_labels[lvl] = concat_lvl_inst_labels[lvl]
+
+        return concat_lvl_mask_labels, concat_lvl_inst_labels, concat_lvl_bboxes, concat_lvl_angles, None
+
+    @torch.no_grad()
+    def _get_target_inst_single(self, gt_bboxes, gt_labels, points, regress_ranges, num_points_per_lvl):
+        """Compute regression, classification and angle targets for a single
+        image."""
+        num_points = points.size(0)
+        num_gts = gt_labels.size(0)
+        if num_gts == 0:
+            return gt_labels.new_full((num_points,), self.num_classes), \
+                   gt_bboxes.new_zeros((num_points, 4)), \
+                   gt_bboxes.new_zeros((num_points, 1))
+
+        areas = gt_bboxes[:, 2] * gt_bboxes[:, 3]
+        # TODO: figure out why these two are different
+        # areas = areas[None].expand(num_points, num_gts)
+        areas = areas[None].repeat(num_points, 1)
+        regress_ranges = regress_ranges[:, None, :].expand(
+            num_points, num_gts, 2)
+        points = points[:, None, :].expand(num_points, num_gts, 2)
+        gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 5)
+        gt_ctr, gt_wh, gt_angle = torch.split(gt_bboxes, [2, 2, 1], dim=2)
+
+        cos_angle, sin_angle = torch.cos(gt_angle), torch.sin(gt_angle)
+        rot_matrix = torch.cat([cos_angle, sin_angle, -sin_angle, cos_angle],
+                               dim=-1).reshape(num_points, num_gts, 2, 2)
+        offset = points - gt_ctr
+        offset = torch.matmul(rot_matrix, offset[..., None])
+        offset = offset.squeeze(-1)
+
+        w, h = gt_wh[..., 0], gt_wh[..., 1]
+        offset_x, offset_y = offset[..., 0], offset[..., 1]
+        left = w / 2 + offset_x
+        right = w / 2 - offset_x
+        top = h / 2 + offset_y
+        bottom = h / 2 - offset_y
+        bbox_targets = torch.stack((left, top, right, bottom), -1)
+
+        # condition1: inside a gt bbox
+        inside_gt_bbox_mask = bbox_targets.min(-1)[0] > 0
+        if self.center_sampling:
+            # condition1: inside a `center bbox`
+            radius = self.center_sample_radius
+            stride = offset.new_zeros(offset.shape)
+
+            # project the points on current lvl back to the `original` sizes
+            lvl_begin = 0
+            for lvl_idx, num_points_lvl in enumerate(num_points_per_lvl):
+
+                lvl_end = lvl_begin + num_points_lvl
+                stride[lvl_begin:lvl_end] = self.strides[lvl_idx] * radius
+                lvl_begin = lvl_end
+
+            inside_center_bbox_mask = (abs(offset) < stride).all(dim=-1)
+            inside_gt_bbox_mask = torch.logical_and(inside_center_bbox_mask,
+                                                    inside_gt_bbox_mask)
+
+        # condition2: limit the regression range for each location
+        max_regress_distance = bbox_targets.max(-1)[0]
+        inside_regress_range = (
+            (max_regress_distance >= regress_ranges[..., 0])
+            & (max_regress_distance <= regress_ranges[..., 1]))
+
+        # if there are still more than one objects for a location,
+        # we choose the one with minimal area
+        areas[inside_gt_bbox_mask == 0] = INF
+        areas[inside_regress_range == 0] = INF
+        min_area, min_area_inds = areas.min(dim=1)
+
+        labels = gt_labels[min_area_inds]
+        labels[min_area == INF] = self.num_classes  # set as BG
+        bbox_targets = bbox_targets[range(num_points), min_area_inds]
+        angle_targets = gt_angle[range(num_points), min_area_inds]
+
+        return labels, bbox_targets, angle_targets
+    
     @torch.no_grad()
     def _get_target_mask_single(self, gt_bboxes, gt_labels, cls_scores_lvl, img_metas, points, num_points_per_lvl):
         """Generate target masks for a single image, and visuzalize the results and generate the pseudo-labels.
@@ -375,52 +694,54 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         """
         num_gts = gt_labels.size(0)
         gt_points = gt_bboxes[:, :2] # just use the center points of gt_bboxes for point-supervised learning
-        num_lvl = len(cls_scores_lvl)
-        featmap_sizes = [cls_scores_lvl[i].shape[-2:] for i in range(num_lvl)]
 
         vis_results = dict()
+        out_results = dict(pse_gt_labels=gt_labels)
 
-        if self.need_pseudo_label or num_gts == 0:
+        if num_gts == 0:
             labels, vis_results = self.dummy_assign_label(points)
         else:
-            labels, extra_results = self.ssp_assign_label(gt_points, gt_labels, points[:, :2], self.num_classes, img_metas)
+            labels, raw_extra_results = self.ssp_assign_label(gt_points, gt_labels, points, self.num_classes, img_metas, 
+                                                              return_boxes=(not self.use_ssp_bboxes) or self.need_visualize or self.need_pseudo_label)
+            out_results['pse_gt_boxes'] = raw_extra_results.get('pse_boxes_hybrid', None)
 
-        if self.is_record_stage:
-            if self.need_visualize or self.need_pseudo_label:
-                _ie_results = self.ssp_instance_extraction(cls_scores_lvl[0], gt_points*0.25, gt_labels, sp_thres=self.sp_thres, 
-                                                  cls_square=self.cls_square, cls_merge=self.cls_merge, cls_overlap=self.cls_overlap, cls_stable=self.cls_stable)
-                cpm_partition, cpm_growing, pse_boxes_pca, pse_boxes_rect, pse_boxes_hybrid =_ie_results
-                pse_labels = torch.concat([gt_labels[gt_labels==cls_id] for cls_id in range(self.num_classes)])
-                pse_gt_bboxes = torch.concat([gt_bboxes[gt_labels==cls_id] for cls_id in range(self.num_classes)])
-
-            if self.need_pseudo_label:
-                ssp_generate_label_single(pse_labels, pse_boxes_pca, img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_pca', format='le90')
-                ssp_generate_label_single(pse_labels, pse_boxes_rect, img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_rect', format='le90')
-                ssp_generate_label_single(pse_labels, pse_boxes_hybrid, img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_mix', format='le90', need_print=True)
-
-            if self.need_visualize:
-                vis_results['cpm_target'] = t2n(torch.split(labels, num_points_per_lvl, dim=0)[0].reshape(*featmap_sizes[0]))
-                vis_results['cpm_pred'] = t2n(cls_scores_lvl[0].sigmoid())
-
-                vis_results['cpm_partition'] = t2n(cpm_partition - 2)
-                vis_results['cpm_growing'] = t2n(cpm_growing - 2)
-
-                vis_results['img_partition'] = t2n(extra_results['img_partition'] - 2)
-                vis_results['img_growing'] = t2n(extra_results['img_growing'] - 2)
-                
-                vis_results['pse_boxes_gt'] = t2n(pse_gt_bboxes)
-                vis_results['pse_boxes_ssp_hybrid'] = t2n(pse_boxes_hybrid)
-                vis_results['pse_labels'] = t2n(pse_labels)
-                vis_results['ori_labels'] = t2n(gt_labels)
-
-                metric, ious = eval_rbox_single_image(pse_boxes_hybrid, pse_gt_bboxes, pse_labels, self.num_classes, class_aware=False)
-                vis_results['metric'] = metric
-                vis_results['ious'] = ious
-
-                visualize_dir = os.path.join(self.store_dir, self.visualize_dir)
-                ssp_visualize_single(vis_results, img_metas, self.runner_info['dataset'], visualize_dir, scale=0.25, need_print=True)
+        if self.use_ssp_bboxes or self.need_visualize or self.need_pseudo_label:
+            cpm_partition, cpm_growing, ssp_extra_results = self.ssp_instance_extraction(cls_scores_lvl[0], gt_points, gt_labels, sp_thres=self.sp_thres, 
+                                              cls_square=self.cls_square, cls_merge=self.cls_merge, cls_overlap=self.cls_overlap, cls_stable=self.cls_stable)
+        #
+            out_results['pse_gt_boxes'] = ssp_extra_results.get('pse_boxes_hybrid', None)
+        #
+        if self.need_pseudo_label:
+            #ssp_generate_label_single(gt_labels, ssp_extra_results['pse_boxes_pca'], img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_pca', format='le90')
+            #ssp_generate_label_single(gt_labels, ssp_extra_results['pse_boxes_rect'], img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_rect', format='le90')
+            ssp_generate_label_single(gt_labels, ssp_extra_results['pse_boxes_hybrid'], img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/ssp_hybrid', format='le90', need_print=True)
+            #ssp_generate_label_single(gt_labels, ssp_extra_results['pse_boxes_auto'], img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_auto', format='le90')
+            ssp_generate_label_single(gt_labels, raw_extra_results['pse_boxes_hybrid'], img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/raw_hybrid', format='le90')
+        #
+        if self.need_visualize:
+            vis_results['cpm_target'] = t2n(torch.split(labels, num_points_per_lvl, dim=0)[0].reshape(*cls_scores_lvl[0].shape[-2:]))
+            vis_results['cpm_pred'] = t2n(cls_scores_lvl[0].sigmoid())
+        #
+            vis_results['cpm_partition'] = t2n(cpm_partition - 2)
+            vis_results['cpm_growing'] = t2n(cpm_growing - 2)
+        #
+            vis_results['img_partition'] = t2n(raw_extra_results['img_partition'] - 2)
+            vis_results['img_growing'] = t2n(raw_extra_results['img_growing'] - 2)
+        # 
+            vis_results['pse_boxes_gt'] = t2n(gt_bboxes)
+            vis_results['pse_boxes_ssp_hybrid'] = t2n(ssp_extra_results['pse_boxes_hybrid'])
+            vis_results['pse_boxes_raw_hybrid'] = t2n(raw_extra_results['pse_boxes_hybrid'])
+            vis_results['pse_labels'] = t2n(gt_labels)
+            vis_results['ori_labels'] = t2n(gt_labels)
+        #
+            metric, ious = eval_rbox_single_image(ssp_extra_results['pse_boxes_hybrid'], gt_bboxes, gt_labels, self.num_classes, class_aware=False)
+            vis_results['metric'] = metric
+            vis_results['ious'] = ious
+        #
+            visualize_dir = os.path.join(self.store_dir, self.visualize_dir)
+            ssp_visualize_single(vis_results, img_metas, self.runner_info['dataset'], visualize_dir, scale=0.25, need_print=True)
         
-        return labels, None
+        return labels, out_results
  
     def dummy_assign_label(self, points):
         """Assign dummy labels for the case when no ground truth is available."""
@@ -429,8 +750,10 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         labels[0] = 0 # assign at least one point to class#bg to avoid error
         return labels, dict()
 
-    def ssp_assign_label(self, gt_points, gt_labels, points, num_classes, img_metas):
+    def ssp_assign_label(self, gt_points, gt_labels, points, num_classes, img_metas, return_boxes=False):
         """Assign labels to points based on ground truth points and labels."""    
+        extra_results = {}
+        scale = 0.25
         default_gt_radius = (8, 128)
         
         device = gt_points.device
@@ -486,7 +809,16 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         ## rg_map, rg_pro_map = self.region_growing(sp_map, raw_img, gt_labels, self.num_classes, need_filter=True)
 
         (h, w), sp_map, ridge_mask, rg_map, rg_pro_map = self.ssp_scaled_partition_growing(
-            img_metas, gt_points, gt_labels, work_scale=0.5, base_scale=0.25)
+            img_metas, gt_points, gt_labels, work_scale=scale*2, base_scale=scale)
+        
+        if return_boxes:
+            boxes_pca = self.box_conversion(rg_map, gt_points*scale, None, use_gt_center=True, mode='pca_minmax')
+            boxes_rect = self.box_conversion(rg_map, gt_points*scale, None, use_gt_center=True, mode='minarea_rect')
+
+            cls_mapping = gt_labels.new_tensor(self.cls_mapping)
+            boxes_hybrid = torch.where((cls_mapping[gt_labels] == 0)[:, None], boxes_pca, boxes_rect)
+            boxes_hybrid[:, :4] /= scale
+            extra_results['pse_boxes_hybrid'] = boxes_hybrid
 
         #rg_pro_map = rg_map
 
@@ -526,10 +858,12 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
             empty_map = None
         #### extral visualize code ####
         
-        return labels, dict(
+        extra_results.update(dict(
             img_partition=sp_map,
             img_growing=rg_map,
-            ideal_mask=empty_map,)
+            ideal_mask=empty_map,))
+        
+        return labels, extra_results
 
     def ssp_scaled_partition_growing(self, img_metas, gt_points, gt_labels, work_scale=0.25, base_scale=0.25):
         """Perform spatial partitioning and region growing on the image at a specified scale."""
@@ -581,11 +915,9 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         y = torch.linspace(0, w, w, device=device)
         xy = torch.stack(torch.meshgrid(x, y, indexing='xy'), -1)
 
-        dm = DistanceMap.get_instance((h, w), device='cuda')
+        dm = DistanceMap.get_instance((h, w))
         sp_map = dm.compute_map_batch(gt_points)
         sp_prob_map, sp_map = torch.max(sp_map, 0)
-        sp_prob_map = sp_prob_map.cuda()
-        sp_map = sp_map.cuda()
 
         #2. Execute partition refinement, which extends the map with bg_id and ing_id
         #2.1 Prepare ridge_mask
@@ -697,6 +1029,7 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         """
         num_cls, h, w = scores.shape
         device = gt_points.device
+        gt_points = gt_points * scale
 
         # 1. normalize scores
         scores = scores.detach().sigmoid()
@@ -740,6 +1073,8 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         pse_boxes_pca = []
         pse_boxes_rect = []
         pse_boxes_hybrid = []
+        #pse_boxes_auto = []
+        
         for cls_id in range(num_cls):
             cls_gt_points = gt_points[gt_labels == cls_id] 
             cls_gt_labels = gt_labels[gt_labels == cls_id]
@@ -756,6 +1091,8 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
 
                 boxes_pca = self.box_conversion(rg_map, cls_gt_points, cls_id, use_gt_center=True, mode='pca_minmax', cls_square=cls_square, cls_stable=cls_stable)
                 boxes_rect = self.box_conversion(rg_map, cls_gt_points, cls_id, use_gt_center=True, mode='minarea_rect', cls_square=cls_square, cls_stable=cls_stable)
+                #boxes_hybrid_auto = self.box_conversion(rg_map, cls_gt_points, cls_id, use_gt_center=True, mode='hybrid', cls_square=cls_square, cls_stable=cls_stable)
+
                 boxes_hybrid = boxes_pca if cls_merge is not None and cls_mapping[cls_id] == 0 else boxes_rect
 
                 cpm_growing.append(rg_map)
@@ -763,19 +1100,33 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                 pse_boxes_pca.append(boxes_pca)
                 pse_boxes_rect.append(boxes_rect)
                 pse_boxes_hybrid.append(boxes_hybrid)
+                #pse_boxes_auto.append(boxes_hybrid_auto)
 
         cpm_partition = torch.stack(cpm_partition, dim=0)
         cpm_growing = torch.stack(cpm_growing, dim=0)
-        pse_boxes_pca = torch.concat(pse_boxes_pca, dim=0)
-        pse_boxes_rect = torch.concat(pse_boxes_rect, dim=0)
-        pse_boxes_hybrid = torch.concat(pse_boxes_hybrid, dim=0)
+
+        gt_ins_labels = torch.arange(len(gt_labels), device=device)
+        pse_ins_labels = torch.concat([gt_ins_labels[gt_labels == cls_id] for cls_id in range(num_cls)])
+        pse_ins_labels[pse_ins_labels.clone()] = gt_ins_labels # reversed index
+
+        pse_boxes_pca = torch.concat(pse_boxes_pca, dim=0)[pse_ins_labels]
+        pse_boxes_rect = torch.concat(pse_boxes_rect, dim=0)[pse_ins_labels]
+        pse_boxes_hybrid = torch.concat(pse_boxes_hybrid, dim=0)[pse_ins_labels]
+        #pse_boxes_auto = torch.concat(pse_boxes_auto, dim=0)[pse_ins_labels]
 
         #4. Scales the resulting bounding boxes according to the provided scale factor.
         pse_boxes_pca[:, :4] /= scale
         pse_boxes_rect[:, :4] /= scale
         pse_boxes_hybrid[:, :4] /= scale
+        #pse_boxes_auto[:, :4] /= scale
 
-        return cpm_partition, cpm_growing, pse_boxes_pca, pse_boxes_rect, pse_boxes_hybrid
+        pseudo_boxes_dict = dict(
+            pse_boxes_pca=pse_boxes_pca,
+            pse_boxes_rect=pse_boxes_rect,
+            pse_boxes_hybrid=pse_boxes_hybrid,
+            #pse_boxes_auto=pse_boxes_auto
+        )
+        return cpm_partition, cpm_growing, pseudo_boxes_dict
 
     def box_conversion(self, ins_map, gt_points, cls_id, use_gt_center=False, mode='minarea_rect', cls_square=None, cls_stable=None):
         """
@@ -800,12 +1151,15 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
 
             elif mode == 'pca_minmax':
                 bbox = self._m2b_pca_minmax(ins_mask_pts, gt_points[ins_id] if use_gt_center else None)
-            else:
+            elif mode == 'minarea_rect':
                 bbox = self._m2b_minarea_rect(ins_mask_pts)
+            else:
+                bbox = self._m2b_hybrid_auto(ins_mask_pts, thres=0.8)
             bboxes.append(bbox)
-        bboxes = torch.tensor(np.array(bboxes), device=ins_map.device)
-
-        bboxes[:, :2] = gt_points if use_gt_center else bboxes[:, :2]
+        bboxes = torch.tensor(np.array(bboxes), dtype=torch.float32, device=ins_map.device)
+        if use_gt_center:
+            bboxes[:, :2] = gt_points if use_gt_center else bboxes[:, :2]
+            #bboxes = self._rbox_clip(bboxes, gt_points, img_shape=ins_map.shape[:2])
         if cls_square is not None and cls_id in cls_square:
             bboxes[:, 4] = 0
 
@@ -826,8 +1180,8 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         center = gt_point if gt_point is not None else mask_pts.mean(dim=0)
         mask_pts = torch.mm(mask_pts - center[None, :], V)
         (l, d), (r, t) = mask_pts.min(0)[0].tolist(), mask_pts.max(0)[0].tolist()
-        #w, h = (r - l).item(), (t - d).item()
-        w, h = 2 * max(abs(l), abs(r)), 2 * max(abs(t), abs(d))
+        w, h = r - l, t - d
+        #w, h = 2 * max(abs(l), abs(r)), 2 * max(abs(t), abs(d))
         bbox = np.array([*center.tolist(), max(w, 0), max(h, 0), theta.item()])
         return bbox
 
@@ -835,3 +1189,230 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         min_rect = cv2.minAreaRect(mask_pts.cpu().numpy())
         bbox = np.array([*min_rect[0], *min_rect[1], min_rect[2] / 180 * np.pi])
         return bbox
+
+    def _m2b_hybrid_auto(self, mask_pts, thres=0.8):
+        box_rect = self._m2b_minarea_rect(mask_pts)
+        box_pca = self._m2b_pca_minmax(mask_pts)
+
+        overlap_rect = mask_rbox_iou(mask_pts.detach().cpu().numpy(), box_rect)
+        overlap_pca = mask_rbox_iou(mask_pts.detach().cpu().numpy(), box_pca)
+
+        if overlap_rect > overlap_pca:
+            return box_rect
+        else:
+            return box_pca
+
+    def _rbox_clip(self, boxes, gt_points, img_shape):
+        """
+        Clip rotated bounding boxes based on ground truth center points.
+        
+        Computes new boxes based on the offset between gt_points and box centers.
+        If the new boxes' edge midpoints exceed image boundaries, the original boxes are used.
+        
+        Args:
+            boxes (torch.Tensor): Rotated bounding boxes with shape (N, 5) in format 
+                                 (x, y, w, h, angle), where angle is in radians
+            gt_points (torch.Tensor): Ground truth center points with shape (N, 2) 
+                                     in format (x, y)
+            img_shape (tuple): Image shape in format (height, width)
+            
+        Returns:
+            tuple: A tuple containing:
+                - final_boxes (torch.Tensor): Processed rotated boxes with shape (N, 5)
+                - new_boxes (torch.Tensor): Computed new boxes with shape (N, 5)
+                - mid_points (torch.Tensor): Edge midpoints with shape (N, 4, 2)
+                - all_in_range (torch.Tensor): Boolean mask indicating if all midpoints 
+                                              are within image boundaries (N,)
+        """
+        # Split box components
+        center, wh, angle = torch.split(boxes, [2, 2, 1], dim=-1)  # center: (N,2), wh: (N,2), angle: (N,1)
+        
+        # Calculate center offset
+        offset = center - gt_points  # (N,2)
+        
+        # Compute rotation matrices for each box angle
+        cos_theta = torch.cos(angle).squeeze(-1)  # (N,)
+        sin_theta = torch.sin(angle).squeeze(-1)  # (N,)
+        
+        # Compute new width and height considering offset and rotation
+        # This is a simplified approach; real applications may require more complex transformations
+        offset = torch.bmm(torch.stack([cos_theta, sin_theta, -sin_theta, cos_theta], dim=-1) \
+                                           .view(-1, 2, 2), offset.unsqueeze(-1)).squeeze(-1).abs()  # (N,2)
+        larger_wh = 2 * (0.5 * wh + offset)
+        smaller_wh = 2 * (0.5 * wh - offset)
+
+        # Construct new boxes using gt_points as centers
+        larger_boxes = torch.cat([gt_points, larger_wh, angle], dim=-1)  # (N,5)
+        smaller_boxes = torch.cat([gt_points, smaller_wh, angle], dim=-1)  # (N,5)
+
+        # Calculate edge midpoints for new boxes
+        mid_points = rbox_to_mid_points(larger_boxes)  # (N,4,2)
+        
+        # Check if midpoints exceed image boundaries
+        h, w = img_shape
+        # Check if each midpoint is within image range
+        in_range = (mid_points[..., 0] >= 0) & (mid_points[..., 0] < w) & \
+                   (mid_points[..., 1] >= 0) & (mid_points[..., 1] < h)  # (N,4)
+        
+        # Use new box if all midpoints are within range, otherwise use original box
+        all_in_range = torch.all(in_range, dim=1)  # (N,)
+        
+        # Select final boxes
+        final_boxes = torch.where(all_in_range.unsqueeze(-1), smaller_boxes, larger_boxes)
+        
+        # Return final boxes and intermediate results for visualization
+        return final_boxes#, new_boxes, mid_points, all_in_range
+
+    @force_fp32(
+        apply_to=('cls_scores', 'bbox_preds', 'angle_preds', 'centernesses'))
+    def get_bboxes(self,
+                   mask_scores,
+                   cls_scores,
+                   bbox_preds,
+                   angle_preds,
+                   centernesses,
+                   img_metas,
+                   cfg=None,
+                   rescale=None):
+        """Transform network output for a batch into bbox predictions.
+
+        Args:
+            cls_scores (list[Tensor]): Box scores for each scale level
+                Has shape (N, num_points * num_classes, H, W)
+            bbox_preds (list[Tensor]): Box energies / deltas for each scale
+                level with shape (N, num_points * 4, H, W)
+            angle_preds (list[Tensor]): Box angle for each scale level \
+                with shape (N, num_points * 1, H, W)
+            centernesses (list[Tensor]): Centerness for each scale level with
+                shape (N, num_points * 1, H, W)
+            img_metas (list[dict]): Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+            cfg (mmcv.Config): Test / postprocessing configuration,
+                if None, test_cfg would be used
+            rescale (bool): If True, return boxes in original image space
+
+        Returns:
+            list[tuple[Tensor, Tensor]]: Each item in result_list is 2-tuple.
+                The first item is an (n, 6) tensor, where the first 5 columns
+                are bounding box positions (x, y, w, h, angle) and the 6-th
+                column is a score between 0 and 1. The second item is a
+                (n,) tensor where each item is the predicted class label of the
+                corresponding box.
+        """
+        assert len(cls_scores) == len(bbox_preds)
+        num_levels = len(cls_scores)
+
+        featmap_sizes = [featmap.size()[-2:] for featmap in [*mask_scores, *cls_scores]]
+
+        mlvl_points = self.prior_generator.grid_priors(featmap_sizes,
+                                                       bbox_preds[0].dtype,
+                                                       bbox_preds[0].device)
+        result_list = []
+        for img_id in range(len(img_metas)):
+            cls_score_list = [
+                cls_scores[i][img_id].detach() for i in range(num_levels)
+            ]
+            bbox_pred_list = [
+                bbox_preds[i][img_id].detach() for i in range(num_levels)
+            ]
+            angle_pred_list = [
+                angle_preds[i][img_id].detach() for i in range(num_levels)
+            ]
+            centerness_pred_list = [
+                centernesses[i][img_id].detach() for i in range(num_levels)
+            ]
+            img_shape = img_metas[img_id]['img_shape']
+            scale_factor = img_metas[img_id]['scale_factor']
+            det_bboxes = self._get_bboxes_single(cls_score_list,
+                                                 bbox_pred_list,
+                                                 angle_pred_list,
+                                                 centerness_pred_list,
+                                                 mlvl_points[1:], img_shape,
+                                                 scale_factor, cfg, rescale)
+            result_list.append(det_bboxes)
+        return result_list
+
+    def _get_bboxes_single(self,
+                           cls_scores,
+                           bbox_preds,
+                           angle_preds,
+                           centernesses,
+                           mlvl_points,
+                           img_shape,
+                           scale_factor,
+                           cfg,
+                           rescale=False):
+        """Transform outputs for a single batch item into bbox predictions.
+
+        Args:
+            cls_scores (list[Tensor]): Box scores for a single scale level
+                Has shape (num_points * num_classes, H, W).
+            bbox_preds (list[Tensor]): Box energies / deltas for a single scale
+                level with shape (num_points * 4, H, W).
+            angle_preds (list[Tensor]): Box angle for a single scale level \
+                with shape (N, num_points * 1, H, W).
+            centernesses (list[Tensor]): Centerness for a single scale level
+                with shape (num_points * 1, H, W).
+            mlvl_points (list[Tensor]): Box reference for a single scale level
+                with shape (num_total_points, 4).
+            img_shape (tuple[int]): Shape of the input image,
+                (height, width, 3).
+            scale_factor (ndarray): Scale factor of the image arrange as
+                (w_scale, h_scale, w_scale, h_scale).
+            cfg (mmcv.Config): Test / postprocessing configuration,
+                if None, test_cfg would be used.
+            rescale (bool): If True, return boxes in original image space.
+
+        Returns:
+            Tensor: Labeled boxes in shape (n, 6), where the first 5 columns
+                are bounding box positions (x, y, w, h, angle) and the
+                6-th column is a score between 0 and 1.
+        """
+        cfg = self.test_cfg if cfg is None else cfg
+        assert len(cls_scores) == len(bbox_preds) == len(mlvl_points)
+        mlvl_bboxes = []
+        mlvl_scores = []
+        mlvl_centerness = []
+        for cls_score, bbox_pred, angle_pred, centerness, points in zip(
+                cls_scores, bbox_preds, angle_preds, centernesses,
+                mlvl_points):
+            assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
+            scores = cls_score.permute(1, 2, 0).reshape(
+                -1, self.cls_out_channels).sigmoid()
+            centerness = centerness.permute(1, 2, 0).reshape(-1).sigmoid()
+
+            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)
+            angle_pred = angle_pred.permute(1, 2, 0).reshape(-1, self.angle_coder.encode_size)
+            decoded_angle_pred = self.angle_coder.decode(angle_pred, keepdim=True)
+            bbox_pred = torch.cat([bbox_pred, decoded_angle_pred], dim=1)
+            nms_pre = cfg.get('nms_pre', -1)
+            if nms_pre > 0 and scores.shape[0] > nms_pre:
+                max_scores, _ = (scores * centerness[:, None]).max(dim=1)
+                _, topk_inds = max_scores.topk(nms_pre)
+                points = points[topk_inds, :]
+                bbox_pred = bbox_pred[topk_inds, :]
+                scores = scores[topk_inds, :]
+                centerness = centerness[topk_inds]
+            bboxes = self.bbox_coder.decode(
+                points, bbox_pred, max_shape=img_shape)
+            mlvl_bboxes.append(bboxes)
+            mlvl_scores.append(scores)
+            mlvl_centerness.append(centerness)
+        mlvl_bboxes = torch.cat(mlvl_bboxes)
+        if rescale:
+            scale_factor = mlvl_bboxes.new_tensor(scale_factor)
+            mlvl_bboxes[..., :4] = mlvl_bboxes[..., :4] / scale_factor
+        mlvl_scores = torch.cat(mlvl_scores)
+        padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
+        # remind that we set FG labels to [0, num_class-1] since mmdet v2.0
+        # BG cat_id: num_class
+        mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
+        mlvl_centerness = torch.cat(mlvl_centerness)
+        det_bboxes, det_labels = multiclass_nms_rotated(
+            mlvl_bboxes,
+            mlvl_scores,
+            cfg.score_thr,
+            cfg.nms,
+            cfg.max_per_img,
+            score_factors=mlvl_centerness)
+        return det_bboxes, det_labels

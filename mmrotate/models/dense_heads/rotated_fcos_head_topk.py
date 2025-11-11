@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+import os
 import torch
 import torch.nn as nn
 from mmcv.cnn import Scale
@@ -9,7 +10,13 @@ from mmdet.core import multi_apply, reduce_mean
 from mmrotate.core import build_bbox_coder, multiclass_nms_rotated
 from ..builder import ROTATED_HEADS, build_loss
 from .rotated_anchor_free_head import RotatedAnchorFreeHead
-from .utils import compute_topk_loss
+
+from mmrotate.core.evaluation import eval_rbox_single_image
+from mmrotate.core.visualization import (
+    ssp_visualize_single_simple,
+    ssp_generate_label_single,
+    t2n,
+)
 
 INF = 1e8
 
@@ -71,6 +78,7 @@ class RotatedFCOSHead(RotatedAnchorFreeHead):
                  centerness_on_reg=False,
                  separate_angle=False,
                  scale_angle=True,
+                 is_record_stage=False,
                  h_bbox_coder=dict(type='DistancePointBBoxCoder'),
                  loss_cls=dict(
                      type='FocalLoss',
@@ -95,6 +103,8 @@ class RotatedFCOSHead(RotatedAnchorFreeHead):
                          std=0.01,
                          bias_prob=0.01)),
                  **kwargs):
+        self.runner_info = {} # assign value through RecordEpochIterHook, containg {'max_epochs': 7, 'max_iters': 22400, 'epoch': 6, 'iter': 38403, 'inner_iter': 3}
+
         self.regress_ranges = regress_ranges
         self.center_sampling = center_sampling
         self.center_sample_radius = center_sample_radius
@@ -115,6 +125,14 @@ class RotatedFCOSHead(RotatedAnchorFreeHead):
             self.loss_angle = build_loss(loss_angle)
             self.h_bbox_coder = build_bbox_coder(h_bbox_coder)
         # Angle predict length
+
+        train_cfg = kwargs['train_cfg'] if kwargs.get('train_cfg') is not None else {}
+        self.store_dir = train_cfg.get('store_dir', None)
+        self.visualize_dir = train_cfg.get('visualize_dir', None)
+        self.pseudo_label_dir = train_cfg.get('pseudo_label_dir', None)
+        self.need_visualize = (self.visualize_dir is not None) and is_record_stage
+        self.need_pseudo_label = (self.pseudo_label_dir is not None) and is_record_stage
+        self.is_record_stage = is_record_stage
 
     def _init_layers(self):
         """Initialize layers of the head."""
@@ -217,6 +235,15 @@ class RotatedFCOSHead(RotatedAnchorFreeHead):
         """
         assert len(cls_scores) == len(bbox_preds) \
                == len(angle_preds) == len(centernesses)
+
+        if self.need_visualize or self.need_pseudo_label:
+            self.predict_boxes_pseudo(cls_scores, bbox_preds, angle_preds, centernesses,
+                                      gt_bboxes, gt_labels, img_metas)
+            return dict(
+                loss_cls=cls_scores[0].mean()*0.0, 
+                loss_bbox=bbox_preds[0].mean()*0.0+angle_preds[0].mean()*0.0, 
+                loss_centerness=centernesses[0].mean()*0.0)
+        
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
             featmap_sizes,
@@ -669,3 +696,225 @@ class RotatedFCOSHead(RotatedAnchorFreeHead):
                 bboxes_list[img_id].append(decode_bbox_i.detach())
 
         return bboxes_list
+
+    def predict_boxes_pseudo(self,
+                   cls_scores,
+                   bbox_preds,
+                   angle_preds,
+                   centernesses,
+                   gt_bboxes,
+                   gt_labels,
+                   img_metas,
+                   cfg=None,
+                   rescale=None):
+        """Transform network output for a batch into bbox predictions.
+
+        Args:
+            cls_scores (list[Tensor]): Box scores for each scale level
+                Has shape (N, num_points * num_classes, H, W)
+            bbox_preds (list[Tensor]): Box energies / deltas for each scale
+                level with shape (N, num_points * 4, H, W)
+            angle_preds (list[Tensor]): Box angle for each scale level \
+                with shape (N, num_points * 1, H, W)
+            centernesses (list[Tensor]): Centerness for each scale level with
+                shape (N, num_points * 1, H, W)
+            img_metas (list[dict]): Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+            cfg (mmcv.Config): Test / postprocessing configuration,
+                if None, test_cfg would be used
+            rescale (bool): If True, return boxes in original image space
+
+        Returns:
+            list[tuple[Tensor, Tensor]]: Each item in result_list is 2-tuple.
+                The first item is an (n, 6) tensor, where the first 5 columns
+                are bounding box positions (x, y, w, h, angle) and the 6-th
+                column is a score between 0 and 1. The second item is a
+                (n,) tensor where each item is the predicted class label of the
+                corresponding box.
+        """
+        assert len(cls_scores) == len(bbox_preds)
+        num_levels = len(cls_scores)
+
+        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
+
+        result_list = []
+        for img_id in range(len(img_metas)):
+            cls_score_list = [
+                cls_scores[i][img_id].detach() for i in range(num_levels)
+            ]
+            bbox_pred_list = [
+                bbox_preds[i][img_id].detach() for i in range(num_levels)
+            ]
+            angle_pred_list = [
+                angle_preds[i][img_id].detach() for i in range(num_levels)
+            ]
+            centerness_pred_list = [
+                centernesses[i][img_id].detach() for i in range(num_levels)
+            ]
+            img_shape = img_metas[img_id]['img_shape']
+            scale_factor = img_metas[img_id]['scale_factor']
+            final_boxes, final_cls, final_scores = self._predict_boxes_pseudo_single(cls_score_list,
+                                                 bbox_pred_list,
+                                                 angle_pred_list,
+                                                 centerness_pred_list,
+                                                 gt_bboxes[img_id],
+                                                 gt_labels[img_id],
+                                                 self.strides)
+            if self.need_pseudo_label:
+                ssp_generate_label_single(gt_labels[img_id], final_boxes, img_metas[img_id], self.runner_info['dataset'], 
+                                      self.pseudo_label_dir+'/ssp_stage2', format='le90', need_print=False)
+            if self.need_visualize:
+                vis_results = {}
+                #vis_results['pse_boxes_gt'] = t2n(gt_bboxes)
+                vis_results['pse_boxes_stage#1'] = t2n(gt_bboxes[img_id])
+                vis_results['pse_boxes_stage#2'] = t2n(final_boxes)
+                vis_results['pse_labels'] = t2n(gt_labels[img_id])
+
+                visualize_dir = os.path.join(self.store_dir, self.visualize_dir)
+                ssp_visualize_single_simple(vis_results, img_metas[img_id], self.runner_info['dataset'], visualize_dir, scale=0.25, need_print=True)
+
+        return result_list
+
+    def _predict_boxes_pseudo_single(self,
+                                       cls_score_list,
+                                       bbox_pred_list,
+                                       angle_pred_list,
+                                       centernesses,
+                                       gt_bboxes,
+                                       gt_labels,
+                                       strides):
+        """
+        针对每个level处理预测特征，聚合结果后选择最高分预测，生成与GT数量一致的伪标签
+        优化点：使用纯torch张量操作替代循环，提升效率
+
+        Args:
+            cls_score_list: 各level的分类分数列表，每个元素形状为[C, H, W]
+            bbox_pred_list: 各level的边界框预测列表，每个元素形状为[4, H, W]
+            angle_pred_list: 各level的角度预测列表，每个元素形状为[angle_dim, H, W]
+            centernesses: 各level的中心度列表，每个元素形状为[1, H, W]
+            gt_bboxes: GT边界框，形状为[N, 4/5]
+            gt_labels: GT类别，形状为[N]
+            strides: 各level的步长列表，形状为[L]
+
+        Returns:
+            final_boxes: 最终伪标签边界框，形状为[N, 5] (x, y, w, h, angle)
+            final_cls: 最终类别（与GT一致），形状为[N]
+            final_scores: 最高得分，形状为[N]
+        """
+        num_levels = len(cls_score_list)  # L: 层级数量
+        num_gts = gt_bboxes.shape[0]     # N: GT数量
+        scale_factor = [1, 1]            # 尺度因子，可根据实际需求调整
+
+        # 初始化存储LxN的结果容器
+        all_boxes = []    # 存储每个level的box，最终形状[L, N, 5]
+        all_scores = []   # 存储每个level的分数(cls*centerness)，最终形状[L, N]
+
+        for lvl_id, (cls_score, bbox_pred, angle_pred, centerness, stride) in enumerate(zip(cls_score_list, bbox_pred_list, angle_pred_list, centernesses, strides)):
+            if lvl_id in (2,3,4,5):
+                continue
+            # 获取当前level特征图尺寸
+            C_cls, H, W = cls_score.shape  # C_cls: 类别数
+
+            # 计算GT在当前level特征图上的位置（基于当前level的步长）
+            gt_pos = (gt_bboxes[:, 0:2] / stride * scale_factor[1]).long()  # [N, 2] (x, y)
+            x_pos, y_pos = gt_pos[:, 0], gt_pos[:, 1]
+
+            # 计算当前level的GT有效性掩码（是否在特征图范围内）
+            gt_valid_mask = (x_pos >= 0) & (x_pos < W) & (y_pos >= 0) & (y_pos < H)  # [N]
+
+            # 将2D坐标转换为1D索引（用于特征提取）
+            gt_idx = y_pos * W + x_pos  # [N]
+            max_flat_idx = H * W - 1
+            gt_idx = gt_idx.clamp(0, max_flat_idx)  # 防止越界
+
+            # 提取当前level的预测值（展平后按索引取）
+            # 边界框预测 [4, H, W] -> [H*W, 4] -> [N, 4]
+            bbox_pred_flat = bbox_pred.permute(1, 2, 0).reshape(-1, 4)  # [H*W, 4]
+            curr_bbox_pred = bbox_pred_flat[gt_idx]  # [N, 4]
+
+            # 分类分数 [C, H, W] -> [H*W, C] -> [N, C]
+            cls_score_flat = cls_score.permute(1, 2, 0).reshape(-1, C_cls)  # [H*W, C]
+            curr_cls_score = cls_score_flat[gt_idx]  # [N, C]
+
+            # 角度预测 [angle_dim, H, W] -> [H*W, angle_dim] -> [N, angle_dim]
+            angle_pred_flat = angle_pred.permute(1, 2, 0).reshape(-1, 1)  # [H*W, angle_dim]
+            curr_angle_pred = angle_pred_flat[gt_idx]  # [N, 1]
+
+            # 中心度 [1, H, W] -> [H*W, 1] -> [N, 1]
+            centerness_flat = centerness.permute(1, 2, 0).reshape(-1, 1)  # [H*W, 1]
+            curr_centerness = centerness_flat[gt_idx]  # [N, 1]
+
+            # 计算边界框的宽高（基于预测的偏移量）
+            w = curr_bbox_pred[:, 0] + curr_bbox_pred[:, 2]  # [N]
+            h = curr_bbox_pred[:, 1] + curr_bbox_pred[:, 3]  # [N]
+
+            # 构建完整边界框 (x, y, w, h, angle)，x,y使用GT的中心
+            curr_boxes = torch.cat([
+                gt_bboxes[:, 0:2],  # 保留GT的中心坐标
+                w[:, None], 
+                h[:, None], 
+                curr_angle_pred
+            ], dim=-1)  # [N, 5]
+
+            # 处理无效的预测（设置宽高为0，角度为0）
+            curr_boxes[~gt_valid_mask, 2:] = 0.0
+
+            # 修正尺度（如果需要）
+            curr_boxes[:, 2:4] = curr_boxes[:, 2:4] / scale_factor[1] * stride
+
+            # 处理正方形类别（角度设为0）
+            #for cls_id in self.square_cls:
+            #    curr_boxes[gt_labels == cls_id, -1] = 0.0
+
+            # 计算分数：分类分数（取对应GT类别的分数）* 中心度
+            # 提取每个GT类别对应的分类分数 [N]
+            cls_scores_gt_class = curr_cls_score[torch.arange(num_gts), gt_labels]  # [N]
+            curr_scores = cls_scores_gt_class * curr_centerness.squeeze(1)  # [N]（cls*centerness）
+
+            # 对无效预测设置极低分数（避免被选中）
+            curr_scores[~gt_valid_mask] = -float('inf')
+
+            # 存储当前level的结果
+            all_boxes.append(curr_boxes)
+            all_scores.append(curr_scores)
+
+        # 聚合所有level的结果 [L, N, 5], [L, N]
+        all_boxes = torch.stack(all_boxes, dim=0)    # [L, N, 5]
+        all_scores = torch.stack(all_scores, dim=0)  # [L, N]
+
+        # 对每个GT（N个），选择所有level中分数最高的预测
+        max_scores, best_level_indices = all_scores.max(dim=0)  # [N], [N]
+
+        # 纯torch实现：提取每个GT的最佳预测结果（替代循环）
+        # 生成索引张量 [N]，用于选择每个GT对应的位置
+        gt_indices = torch.arange(num_gts, device=best_level_indices.device)
+
+        # 使用高级索引一次性提取所有最佳box (L, N, 5) -> (N, 5)
+        final_boxes = all_boxes[best_level_indices, gt_indices]
+
+        # 类别直接使用GT类别（保持与GT一致）
+        final_cls = gt_labels  # [N]
+
+        # 最高分即为之前计算的max_scores
+        final_scores = max_scores  # [N]
+
+        return final_boxes, final_cls, final_scores
+
+
+def compute_topk_loss(raw_loss, weight=None, avg_factor=None, topk_ratio=None):
+    assert not (weight is None and avg_factor is None)
+
+    if raw_loss.ndim == 2:
+        raw_loss = raw_loss.sum(dim=1)
+    raw_loss = raw_loss * weight if weight is not None else raw_loss
+    if topk_ratio is not None:
+        k = max(1, int(len(raw_loss) * topk_ratio))
+        topk_vals, topk_inds = torch.topk(raw_loss, k=k, largest=False)
+    else:
+        topk_vals, topk_inds = raw_loss, torch.arange(len(raw_loss), device=raw_loss.device)
+    if avg_factor is not None and topk_ratio is not None:
+        avg_factor = avg_factor * topk_ratio#max(reduce_mean(avg_factor), 1.0)
+    if weight is not None:
+        avg_factor = max(reduce_mean(weight[topk_inds].sum().detach()), 1e-6)
+    final_loss = topk_vals.sum() / avg_factor
+    return final_loss

@@ -10,6 +10,7 @@ from mmdet.models.utils import build_linear_layer
 
 from mmrotate.core import build_bbox_coder, multiclass_nms_rotated
 from ...builder import ROTATED_HEADS, build_loss
+from mmrotate.models.dense_heads.utils import compute_topk_loss
 
 
 @ROTATED_HEADS.register_module()
@@ -344,12 +345,14 @@ class RotatedBBoxHead(BaseModule):
                         bbox_pred.size(0), -1,
                         5)[pos_inds.type(torch.bool),
                            labels[pos_inds.type(torch.bool)]]
-                losses['loss_bbox'] = self.loss_bbox(
+                loss_bbox = self.loss_bbox(
                     pos_bbox_pred,
                     bbox_targets[pos_inds.type(torch.bool)],
-                    bbox_weights[pos_inds.type(torch.bool)],
-                    avg_factor=bbox_targets.size(0),
-                    reduction_override=reduction_override)
+                    #bbox_weights[pos_inds.type(torch.bool)],
+                    #avg_factor=bbox_targets.size(0),
+                    #reduction_override=reduction_override)
+                    reduction_override='none',)
+                losses['loss_bbox'] = compute_topk_loss(loss_bbox, weight=bbox_weights[pos_inds.type(torch.bool)], avg_factor=bbox_targets.size(0), topk_ratio=0.95)
             else:
                 losses['loss_bbox'] = bbox_pred[pos_inds].sum()
         return losses

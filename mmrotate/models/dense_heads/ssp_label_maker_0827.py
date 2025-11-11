@@ -11,7 +11,7 @@ from mmdet.core import multi_apply, reduce_mean
 
 from ..builder import ROTATED_HEADS
 from .rotated_fcos_head import RotatedFCOSHead
-from .utils import DistanceMap, watershed_segmentation
+from .utils import DistanceMap, watershed_segmentation, mask_rbox_iou, rbox_to_mid_points
 
 from mmrotate.core.evaluation import eval_rbox_single_image
 from mmrotate.core.visualization import (
@@ -99,10 +99,9 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         super().__init__(*args, **kwargs)
 
         self.runner_info = {} # assign value through RecordEpochIterHook, containg {'max_epochs': 7, 'max_iters': 22400, 'epoch': 6, 'iter': 38403, 'inner_iter': 3}
-        train_cfg = kwargs['train_cfg'] if kwargs.get('train_cfg') is not None else {}
-        self.store_dir = train_cfg.get('store_dir', None)
-        self.visualize_dir = train_cfg.get('visualize_dir', None)
-        self.pseudo_label_dir = train_cfg.get('pseudo_label_dir', None)
+        self.store_dir = kwargs.get('train_cfg').get('store_dir', None)
+        self.visualize_dir = kwargs.get('train_cfg').get('visualize_dir', None)
+        self.pseudo_label_dir = kwargs.get('train_cfg').get('pseudo_label_dir', None)
         self.need_visualize = (self.visualize_dir is not None) and is_record_stage
         self.need_pseudo_label = (self.pseudo_label_dir is not None) and is_record_stage
         self.is_record_stage = is_record_stage
@@ -389,7 +388,7 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
             if self.need_visualize or self.need_pseudo_label:
                 _ie_results = self.ssp_instance_extraction(cls_scores_lvl[0], gt_points*0.25, gt_labels, sp_thres=self.sp_thres, 
                                                   cls_square=self.cls_square, cls_merge=self.cls_merge, cls_overlap=self.cls_overlap, cls_stable=self.cls_stable)
-                cpm_partition, cpm_growing, pse_boxes_pca, pse_boxes_rect, pse_boxes_hybrid =_ie_results
+                cpm_partition, cpm_growing, pse_boxes_pca, pse_boxes_rect, pse_boxes_hybrid, pse_boxes_auto =_ie_results
                 pse_labels = torch.concat([gt_labels[gt_labels==cls_id] for cls_id in range(self.num_classes)])
                 pse_gt_bboxes = torch.concat([gt_bboxes[gt_labels==cls_id] for cls_id in range(self.num_classes)])
 
@@ -397,6 +396,7 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                 ssp_generate_label_single(pse_labels, pse_boxes_pca, img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_pca', format='le90')
                 ssp_generate_label_single(pse_labels, pse_boxes_rect, img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_rect', format='le90')
                 ssp_generate_label_single(pse_labels, pse_boxes_hybrid, img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_mix', format='le90', need_print=True)
+                ssp_generate_label_single(pse_labels, pse_boxes_auto, img_metas, self.runner_info['dataset'], self.pseudo_label_dir+'/vor_auto', format='le90')
 
             if self.need_visualize:
                 vis_results['cpm_target'] = t2n(torch.split(labels, num_points_per_lvl, dim=0)[0].reshape(*featmap_sizes[0]))
@@ -581,11 +581,9 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         y = torch.linspace(0, w, w, device=device)
         xy = torch.stack(torch.meshgrid(x, y, indexing='xy'), -1)
 
-        dm = DistanceMap.get_instance((h, w), device='cuda')
+        dm = DistanceMap.get_instance((h, w))
         sp_map = dm.compute_map_batch(gt_points)
         sp_prob_map, sp_map = torch.max(sp_map, 0)
-        sp_prob_map = sp_prob_map.cuda()
-        sp_map = sp_map.cuda()
 
         #2. Execute partition refinement, which extends the map with bg_id and ing_id
         #2.1 Prepare ridge_mask
@@ -740,6 +738,7 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         pse_boxes_pca = []
         pse_boxes_rect = []
         pse_boxes_hybrid = []
+        pse_boxes_auto = []
         for cls_id in range(num_cls):
             cls_gt_points = gt_points[gt_labels == cls_id] 
             cls_gt_labels = gt_labels[gt_labels == cls_id]
@@ -756,6 +755,8 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
 
                 boxes_pca = self.box_conversion(rg_map, cls_gt_points, cls_id, use_gt_center=True, mode='pca_minmax', cls_square=cls_square, cls_stable=cls_stable)
                 boxes_rect = self.box_conversion(rg_map, cls_gt_points, cls_id, use_gt_center=True, mode='minarea_rect', cls_square=cls_square, cls_stable=cls_stable)
+                boxes_hybrid_auto = self.box_conversion(rg_map, cls_gt_points, cls_id, use_gt_center=True, mode='hybrid', cls_square=cls_square, cls_stable=cls_stable)
+
                 boxes_hybrid = boxes_pca if cls_merge is not None and cls_mapping[cls_id] == 0 else boxes_rect
 
                 cpm_growing.append(rg_map)
@@ -763,19 +764,22 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                 pse_boxes_pca.append(boxes_pca)
                 pse_boxes_rect.append(boxes_rect)
                 pse_boxes_hybrid.append(boxes_hybrid)
+                pse_boxes_auto.append(boxes_hybrid_auto)
 
         cpm_partition = torch.stack(cpm_partition, dim=0)
         cpm_growing = torch.stack(cpm_growing, dim=0)
         pse_boxes_pca = torch.concat(pse_boxes_pca, dim=0)
         pse_boxes_rect = torch.concat(pse_boxes_rect, dim=0)
         pse_boxes_hybrid = torch.concat(pse_boxes_hybrid, dim=0)
+        pse_boxes_auto = torch.concat(pse_boxes_auto, dim=0)
 
         #4. Scales the resulting bounding boxes according to the provided scale factor.
         pse_boxes_pca[:, :4] /= scale
         pse_boxes_rect[:, :4] /= scale
         pse_boxes_hybrid[:, :4] /= scale
+        pse_boxes_auto[:, :4] /= scale
 
-        return cpm_partition, cpm_growing, pse_boxes_pca, pse_boxes_rect, pse_boxes_hybrid
+        return cpm_partition, cpm_growing, pse_boxes_pca, pse_boxes_rect, pse_boxes_hybrid, pse_boxes_auto
 
     def box_conversion(self, ins_map, gt_points, cls_id, use_gt_center=False, mode='minarea_rect', cls_square=None, cls_stable=None):
         """
@@ -799,13 +803,16 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
                 bbox = np.array([*gt_points[ins_id].cpu(), 0, 0, 0])
 
             elif mode == 'pca_minmax':
-                bbox = self._m2b_pca_minmax(ins_mask_pts, gt_points[ins_id] if use_gt_center else None)
-            else:
+                bbox = self._m2b_pca_minmax(ins_mask_pts, gt_point=None)
+            elif mode == 'minarea_rect':
                 bbox = self._m2b_minarea_rect(ins_mask_pts)
+            else:
+                bbox = self._m2b_hybrid_auto(ins_mask_pts, thres=0.8)
             bboxes.append(bbox)
         bboxes = torch.tensor(np.array(bboxes), device=ins_map.device)
-
-        bboxes[:, :2] = gt_points if use_gt_center else bboxes[:, :2]
+        if use_gt_center:
+            #bboxes[:, :2] = gt_points if use_gt_center else bboxes[:, :2]
+            bboxes = self._rbox_clip(bboxes, gt_points, img_shape=ins_map.shape[:2])
         if cls_square is not None and cls_id in cls_square:
             bboxes[:, 4] = 0
 
@@ -826,8 +833,8 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         center = gt_point if gt_point is not None else mask_pts.mean(dim=0)
         mask_pts = torch.mm(mask_pts - center[None, :], V)
         (l, d), (r, t) = mask_pts.min(0)[0].tolist(), mask_pts.max(0)[0].tolist()
-        #w, h = (r - l).item(), (t - d).item()
-        w, h = 2 * max(abs(l), abs(r)), 2 * max(abs(t), abs(d))
+        w, h = r - l, t - d
+        #w, h = 2 * max(abs(l), abs(r)), 2 * max(abs(t), abs(d))
         bbox = np.array([*center.tolist(), max(w, 0), max(h, 0), theta.item()])
         return bbox
 
@@ -835,3 +842,76 @@ class SSPLabelMarkerHead(RotatedFCOSHead):
         min_rect = cv2.minAreaRect(mask_pts.cpu().numpy())
         bbox = np.array([*min_rect[0], *min_rect[1], min_rect[2] / 180 * np.pi])
         return bbox
+
+    def _m2b_hybrid_auto(self, mask_pts, thres=0.8):
+        box_rect = self._m2b_minarea_rect(mask_pts)
+        box_pca = self._m2b_pca_minmax(mask_pts)
+
+        overlap_rect = mask_rbox_iou(mask_pts.detach().cpu().numpy(), box_rect)
+        overlap_pca = mask_rbox_iou(mask_pts.detach().cpu().numpy(), box_pca)
+
+        if overlap_rect > overlap_pca:
+            return box_rect
+        else:
+            return box_pca
+
+    def _rbox_clip(self, boxes, gt_points, img_shape):
+        """
+        Clip rotated bounding boxes based on ground truth center points.
+        
+        Computes new boxes based on the offset between gt_points and box centers.
+        If the new boxes' edge midpoints exceed image boundaries, the original boxes are used.
+        
+        Args:
+            boxes (torch.Tensor): Rotated bounding boxes with shape (N, 5) in format 
+                                 (x, y, w, h, angle), where angle is in radians
+            gt_points (torch.Tensor): Ground truth center points with shape (N, 2) 
+                                     in format (x, y)
+            img_shape (tuple): Image shape in format (height, width)
+            
+        Returns:
+            tuple: A tuple containing:
+                - final_boxes (torch.Tensor): Processed rotated boxes with shape (N, 5)
+                - new_boxes (torch.Tensor): Computed new boxes with shape (N, 5)
+                - mid_points (torch.Tensor): Edge midpoints with shape (N, 4, 2)
+                - all_in_range (torch.Tensor): Boolean mask indicating if all midpoints 
+                                              are within image boundaries (N,)
+        """
+        # Split box components
+        center, wh, angle = torch.split(boxes, [2, 2, 1], dim=-1)  # center: (N,2), wh: (N,2), angle: (N,1)
+        
+        # Calculate center offset
+        offset = center - gt_points  # (N,2)
+        
+        # Compute rotation matrices for each box angle
+        cos_theta = torch.cos(angle).squeeze(-1)  # (N,)
+        sin_theta = torch.sin(angle).squeeze(-1)  # (N,)
+        
+        # Compute new width and height considering offset and rotation
+        # This is a simplified approach; real applications may require more complex transformations
+        offset = torch.bmm(torch.stack([cos_theta, sin_theta, -sin_theta, cos_theta], dim=-1) \
+                                           .view(-1, 2, 2), offset.unsqueeze(-1)).squeeze(-1).abs()  # (N,2)
+        larger_wh = 2 * (0.5 * wh + offset)
+        smaller_wh = 2 * (0.5 * wh - offset)
+
+        # Construct new boxes using gt_points as centers
+        larger_boxes = torch.cat([gt_points, larger_wh, angle], dim=-1)  # (N,5)
+        smaller_boxes = torch.cat([gt_points, smaller_wh, angle], dim=-1)  # (N,5)
+
+        # Calculate edge midpoints for new boxes
+        mid_points = rbox_to_mid_points(larger_boxes)  # (N,4,2)
+        
+        # Check if midpoints exceed image boundaries
+        h, w = img_shape
+        # Check if each midpoint is within image range
+        in_range = (mid_points[..., 0] >= 0) & (mid_points[..., 0] < w) & \
+                   (mid_points[..., 1] >= 0) & (mid_points[..., 1] < h)  # (N,4)
+        
+        # Use new box if all midpoints are within range, otherwise use original box
+        all_in_range = torch.all(in_range, dim=1)  # (N,)
+        
+        # Select final boxes
+        final_boxes = torch.where(all_in_range.unsqueeze(-1), smaller_boxes, larger_boxes)
+        
+        # Return final boxes and intermediate results for visualization
+        return final_boxes#, new_boxes, mid_points, all_in_range

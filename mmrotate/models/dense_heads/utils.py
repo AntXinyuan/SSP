@@ -3,6 +3,7 @@ import torch
 from mmcv.ops import convex_iou
 import numpy as np
 import cv2
+from mmdet.core import reduce_mean
 
 
 def points_center_pts(RPoints, y_first=True):
@@ -133,11 +134,12 @@ class DistanceMap:
     # Cache for instances to avoid recomputing templates for the same parameters
     _instances = {}
 
-    def __init__(self, size, dist='gaussian', sigma=4096, normalize=False, device='cuda'):
+    def __init__(self, size, dist='gaussian', sigma=4096, normalize=False, device='cuda', gpu_thres=500):
         assert dist in ['gaussian', 'l2'], "dist must be either 'gaussian' or 'l2'"
         self.h = size[0]
         self.w = size[1]
         self.device = device
+        self.gpu_thres = gpu_thres
 
         self._sigma = sigma
         
@@ -199,13 +201,14 @@ class DistanceMap:
     
     def compute_map_batch(self, mus):
         N = len(mus)
+        device = self.device if N <= self.gpu_thres else 'cpu'
         
-        template_y_start = self.center_y - mus[:, 1].long()  # [N, ]
-        template_x_start = self.center_x - mus[:, 0].long()  # [N, ]
+        template_y_start = (self.center_y - mus[:, 1].long()).to(device)  # [N, ]
+        template_x_start = (self.center_x - mus[:, 0].long()).to(device)  # [N, ]
         
-        batch_idx = torch.arange(N, device=self.device).view(-1, 1, 1)         # [N, 1, 1]
-        result_y_idx = torch.arange(self.h, device=self.device).view(1, -1, 1) # [1, h, 1]
-        result_x_idx = torch.arange(self.w, device=self.device).view(1, 1, -1) # [1, 1, w]
+        batch_idx = torch.arange(N, device=device).view(-1, 1, 1)         # [N, 1, 1]
+        result_y_idx = torch.arange(self.h, device=device).view(1, -1, 1) # [1, h, 1]
+        result_x_idx = torch.arange(self.w, device=device).view(1, 1, -1) # [1, 1, w]
         
         template_y_idx = template_y_start.view(-1, 1, 1) + result_y_idx  # [N, h, 1]
         template_x_idx = template_x_start.view(-1, 1, 1) + result_x_idx  # [N, 1, w]
@@ -213,8 +216,8 @@ class DistanceMap:
         template_y_idx = template_y_idx.expand(-1, -1, self.w) # [N, h, w]
         template_x_idx = template_x_idx.expand(-1, self.h, -1) # [N, h, w]
         
-        result = torch.zeros(N, self.h, self.w, device=self.device)
-        result[batch_idx, result_y_idx, result_x_idx] = self.template[template_y_idx, template_x_idx]
+        result = torch.zeros(N, self.h, self.w, device=device)
+        result[batch_idx, result_y_idx, result_x_idx] = self.template.to(device)[template_y_idx, template_x_idx]
         
         return result
 
@@ -243,3 +246,149 @@ def watershed_segmentation(image, markers, use_cuda_ops=False):
         segs = torch.tensor(cv2.watershed(image, markers), device=device, dtype=torch.int64)
 
     return segs
+
+def compute_topk_loss(raw_loss, weight=None, avg_factor=None, need_gpu_reduce=False, topk_ratio=None):
+    assert not (weight is None and avg_factor is None)
+
+    if raw_loss.ndim == 2:
+        raw_loss = raw_loss.sum(dim=1)
+    if weight.ndim == 2:
+        weight = weight.mean(dim=1)
+    raw_loss = raw_loss * weight if weight is not None else raw_loss
+    if topk_ratio is not None:
+        k = max(1, int(len(raw_loss) * topk_ratio))
+        topk_vals, topk_inds = torch.topk(raw_loss, k=k, largest=False)
+    else:
+        topk_vals, topk_inds = raw_loss, torch.arange(len(raw_loss), device=raw_loss.device)
+    if weight is not None:
+        new_avg_factor = max(reduce_mean(weight[topk_inds].sum().detach()), 1e-6)
+    if avg_factor is not None:
+        new_avg_factor = max(reduce_mean(avg_factor), 1.0) if need_gpu_reduce else avg_factor*topk_ratio
+    final_loss = topk_vals.sum() / new_avg_factor
+    return final_loss
+
+
+from shapely.geometry import Polygon
+
+def mask_rbox_iou(mask_pts, rbox):
+    """
+    Compute IoU between the convex hull of mask points and a rotated rectangle.
+
+    Args:
+        mask_pts (np.ndarray): Array of shape (N, 2), coordinates of mask vertices.
+        rbox (tuple or list): Rotated rectangle parameters (xc, yc, w, h, theta), where:
+            xc, yc: center coordinates,
+            w: width,
+            h: height,
+            theta: rotation angle (radians)
+
+    Returns:
+        float: IoU value between the two polygons.
+    """
+    # 1. Convert mask points to convex hull
+    mask_pts = np.asarray(mask_pts, dtype=np.float32)
+    if mask_pts.ndim != 2 or mask_pts.shape[1] != 2:
+        raise ValueError("mask_pts must be an array of shape (N, 2)")
+    
+    convex_hull = cv2.convexHull(mask_pts)
+    convex_hull = convex_hull.reshape(-1, 2)
+    
+    # 2. Convert rotated rectangle to polygon (4 vertices)
+    xc, yc, w, h, theta = rbox
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+    half_w = w / 2.0
+    half_h = h / 2.0
+
+    vertices = [
+        [
+            xc - half_w * cos_theta - half_h * sin_theta,
+            yc - half_w * sin_theta + half_h * cos_theta
+        ],
+        [
+            xc + half_w * cos_theta - half_h * sin_theta,
+            yc + half_w * sin_theta + half_h * cos_theta
+        ],
+        [
+            xc + half_w * cos_theta + half_h * sin_theta,
+            yc + half_w * sin_theta - half_h * cos_theta
+        ],
+        [
+            xc - half_w * cos_theta + half_h * sin_theta,
+            yc - half_w * sin_theta - half_h * cos_theta
+        ]
+    ]
+    rbox_poly = np.array(vertices, dtype=np.float32)
+    
+    # 3. Use shapely to compute IoU
+    try:
+        hull_poly = Polygon(convex_hull)
+        rbox_shapely = Polygon(rbox_poly)
+        
+        if not hull_poly.intersects(rbox_shapely):
+            return 0.0
+        
+        area_hull = hull_poly.area
+        area_rbox = rbox_shapely.area
+        area_inter = hull_poly.intersection(rbox_shapely).area
+        
+        area_union = area_hull + area_rbox - area_inter
+        if area_union == 0:
+            return 0.0
+        
+        return area_inter / area_union
+    
+    except Exception as e:
+        # Handle invalid polygons or other exceptions
+        print(f"Error computing IoU: {e}")
+        return 0.0
+
+def rbox_to_mid_points(boxes):
+    """
+    Calculate the midpoints of the four edges of rotated bounding boxes.
+    
+    For each rotated box, computes the midpoints of the four edges (top, right, bottom, left)
+    by applying rotation transformation to local coordinate midpoints and then translating
+    to the image coordinate system.
+    
+    Args:
+        boxes (torch.Tensor): Rotated bounding boxes with shape (N, 5) in format 
+                             (x, y, w, h, angle), where angle is in radians
+                             
+    Returns:
+        torch.Tensor: Edge midpoints with shape (N, 4, 2), where the second dimension
+                     represents the 4 edges (top, right, bottom, left) and the third
+                     dimension represents the (x, y) coordinates
+    """
+    n = boxes.shape[0]
+    mid_points = torch.zeros((n, 4, 2), device=boxes.device)  # 4 edge midpoints
+    
+    for i in range(n):
+        x, y, w, h, angle = boxes[i]
+        
+        # Calculate edge midpoints in local coordinate system
+        half_w = w / 2
+        half_h = h / 2
+        
+        # Midpoints in local coordinate system (before rotation)
+        # Order: top, right, bottom, left
+        local_mids = torch.tensor([
+            [0, -half_h],   # Top edge midpoint
+            [half_w, 0],    # Right edge midpoint
+            [0, half_h],    # Bottom edge midpoint
+            [-half_w, 0]    # Left edge midpoint
+        ], device=boxes.device)
+        
+        # Apply rotation transformation
+        cos_theta = torch.cos(angle)
+        sin_theta = torch.sin(angle)
+        rot_matrix = torch.tensor([
+            [cos_theta, -sin_theta],
+            [sin_theta, cos_theta]
+        ], device=boxes.device)
+        
+        # Rotate and translate to image coordinate system
+        rotated_mids = torch.matmul(local_mids, rot_matrix.T) + torch.tensor([x, y], device=boxes.device)
+        mid_points[i] = rotated_mids
+        
+    return mid_points
