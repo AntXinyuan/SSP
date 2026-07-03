@@ -17,7 +17,6 @@ from .rotated_retina_refine_head import RotatedRetinaRefineHead
 from .rotated_rpn_head import RotatedRPNHead
 from .sam_reppoints_head import SAMRepPointsHead
 from .ssp_label_maker import SSPLabelMarkerHead
-from .ssp_label_maker_v2 import SSPLabelMarkerV2Head
 
 __all__ = [
     'RotatedAnchorHead', 'RotatedRetinaHead', 'RotatedRPNHead',
@@ -26,5 +25,5 @@ __all__ = [
     'RotatedRepPointsHead', 'SAMRepPointsHead', 'CSLRRetinaHead',
     'RotatedATSSHead', 'RotatedAnchorFreeHead', 'RotatedFCOSHead',
     'CSLRFCOSHead', 'OrientedRepPointsHead',
-    'SSPLabelMarkerHead', 'SSPLabelMarkerV2Head',
+    'SSPLabelMarkerHead',
 ]
