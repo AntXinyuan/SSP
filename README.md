@@ -1,4 +1,4 @@
-# Semantic-decoupled Spatial Partition Guided Point-supervised Oriented Object Detection
+# Semantic-decoupled Spatial Partition Guided Point-supervised Oriented Object Detection [PR'26]
 
 [![arxiv](https://img.shields.io/badge/arXiv-2506.10601-479ee2.svg)](https://arxiv.org/pdf/2506.10601)
 [![Github](https://img.shields.io/badge/GitHub-SSP-blueviolet.svg)](https://github.com/antxinyuan/ssp)
@@ -19,7 +19,8 @@ To tackle inadequate sample assignment and instance confusion in point-supervise
 ![method](figs/pipeline.png "Method pipeline")
 
 ## Updates 
-- [2025.6.26] The codes for training labelmaker & generating pseudo-labels are released.
+- [2026.7.4] The codes for training labelmaker & generating pseudo-labels are released.
+- [2026.5.23] The paper is accepted by Pattern Recognition 2026.
 - [2025.6.17] The codes for training detectors by pseudo labels are released.
 - [2025.6.13] TopoPoint paper is released at [arXiv](https://arxiv.org/abs/2506.10601).
 
@@ -68,19 +69,20 @@ These two version of pseudo-labels are aviailable in [here](https://huggingface.
 
 | Dataset | mAP | mIoU | ann_file |
 | :-: | :-: | :-: | :-: | 
+| DOTA-v1.0 | 36.80 |49.51 | pseudo_labels/ssp_dotav10_hybrid_2xresolution/ |
 | DOTA-v1.0 | 34.86 |48.55 | pseudo_labels/ssp_dotav10_hybrid_new/ |
 | DOTA-v1.0 | 34.95 |49.03 | pseudo_labels/ssp_dotav10_hybrid_old/ |
 | DOTA-v1.5 | 28.89 | 44.92 | pseudo_labels/ssp_dotav15_hybrid/ |
 | DOTA-v2.0 | 24.72 | 41.93 | pseudo_labels/ssp_dotav20_hybrid/ |
 
 ### Detectors performance
-> *repro., old* are trained with *ssp_dotav10_hybrid_old*, while *new* are trained with *ssp_dotav10_hybrid_new*.
+> current results are trained with *ssp_dotav10_hybrid_2xresolution*.
 
-| Model | Config | Log | Checkpoint | mAP(paper) | mAP(repro., old) | mAP(repro., new) |
-| :-: | :-: | :-: | :-: | :-: | :-: | :-: |  
-| SSP(RFOCS) | [config](configs/ssp/rfcos_ssp_dotav10.py) | [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/logs/rfcos_ssp_dotav10.json) |  [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/models/rfcos_ssp_dotav10-4c17ff33.pth) | 45.78 | 45.82 | 45.23 |
-| SSP(ORCNN) | [config](configs/ssp/orcnn_ssp_dotav10.py) |  [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/logs/orcnn_ssp_dotav10.json) | [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/models/orcnn_ssp_dotav10-2df034d3.pth) | 47.86 | 48.81 | 49.16 | 
-| SSP(ReDet) | [config](configs/ssp/orcnn_ssp_dotav20.py) |  [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/logs/redet_ssp_dotav10.json) | [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/models/redet_ssp_dotav10-eed2738e.pth) | 48.50 | 49.02 | 50.17 |
+| Model | Config | Log | Checkpoint | mAP |
+| :-: | :-: | :-: | :-: | :-: | 
+| SSP(RFOCS) | [config](configs/ssp/rfcos_ssp_dotav10.py) | [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/logs.zip) |  [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/models/rfcos_ssp_dotav10-ec0cd9cd.pth) | 48.41 |
+| SSP(ORCNN) | [config](configs/ssp/orcnn_ssp_dotav10.py) |  [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/logs.zip) | [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/models/orcnn_ssp_dotav10-e4379e23.pth) | 50.00 | 
+| SSP(ReDet) | [config](configs/ssp/orcnn_ssp_dotav20.py) |  [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/logs.zip) | [hugging face](https://huggingface.co/antxinyuan/SSP/blob/main/models/redet_ssp_dotav10-a2e22558.pth) | 50.81 |
 
 
 
@@ -93,15 +95,20 @@ If you find this work helpful for your research, please consider giving this rep
 If this work is helpful for your research, please consider citing the following BibTeX entry.
 
 ``` bibtex
-@misc{liu2025ssp,
-      title={Semantic-decoupled Spatial Partition Guided Point-supervised Oriented Object Detection}, 
-      author={Xinyuan Liu and Hang Xu and Yike Ma and Yucheng Zhang and Feng Dai},
-      year={2025},
-      eprint={2506.10601},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2506.10601}, 
+@article{liu2026ssp,
+title = {Semantic-decoupled spatial partition guided point-supervised oriented object detection},
+journal = {Pattern Recognition},
+pages = {114079},
+year = {2026},
+issn = {0031-3203},
+doi = {https://doi.org/10.1016/j.patcog.2026.114079},
+url = {https://www.sciencedirect.com/science/article/pii/S0031320326010447},
+author = {Xinyuan Liu and Hang Xu and Zirui Chen and Yike Ma and Chenggang Yan and Feng Dai},
+keywords = {Object detection, Weakly-supervised learning},
 }
+
+
+
 
 @inproceedings{xu2024acm,
   title={Rethinking boundary discontinuity problem for oriented object detection},
