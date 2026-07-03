@@ -96,19 +96,16 @@ If this work is helpful for your research, please consider citing the following 
 
 ``` bibtex
 @article{liu2026ssp,
-title = {Semantic-decoupled spatial partition guided point-supervised oriented object detection},
-journal = {Pattern Recognition},
-pages = {114079},
-year = {2026},
-issn = {0031-3203},
-doi = {https://doi.org/10.1016/j.patcog.2026.114079},
-url = {https://www.sciencedirect.com/science/article/pii/S0031320326010447},
-author = {Xinyuan Liu and Hang Xu and Zirui Chen and Yike Ma and Chenggang Yan and Feng Dai},
-keywords = {Object detection, Weakly-supervised learning},
+  title = {Semantic-decoupled spatial partition guided point-supervised oriented object detection},
+  journal = {Pattern Recognition},
+  pages = {114079},
+  year = {2026},
+  issn = {0031-3203},
+  doi = {https://doi.org/10.1016/j.patcog.2026.114079},
+  url = {https://www.sciencedirect.com/science/article/pii/S0031320326010447},
+  author = {Xinyuan Liu and Hang Xu and Zirui Chen and Yike Ma and Chenggang Yan and Feng Dai},
+  keywords = {Object detection, Weakly-supervised learning},
 }
-
-
-
 
 @inproceedings{xu2024acm,
   title={Rethinking boundary discontinuity problem for oriented object detection},
