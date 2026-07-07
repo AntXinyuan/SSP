@@ -20,9 +20,9 @@ To tackle inadequate sample assignment and instance confusion in point-supervise
 
 ## Updates 
 - [2026.7.4] The codes for training labelmaker & generating pseudo-labels are released.
-- [2026.5.23] The paper is accepted by Pattern Recognition 2026.
+- [2026.5.23] The paper is accepted by [Pattern Recognition 2026](https://doi.org/10.1016/j.patcog.2026.114079).
 - [2025.6.17] The codes for training detectors by pseudo labels are released.
-- [2025.6.13] TopoPoint paper is released at [arXiv](https://arxiv.org/abs/2506.10601).
+- [2025.6.13] The paper is released at [arXiv](https://arxiv.org/abs/2506.10601).
 
 ### 🛠️ Installation
 
